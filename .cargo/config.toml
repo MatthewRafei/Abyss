@@ -1,0 +1,8 @@
+# Built on the machine that runs it (see README), so tune for this CPU.
+# Hardening: full RELRO and immediate binding (PIE is already the default).
+[build]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+]

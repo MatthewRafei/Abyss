@@ -1,0 +1,520 @@
+/* Abyss: plain, rounded, colour shows state. Follows the wallpaper through
+ * the --hud-* variables wallpaper-theme writes into gtk-4.0/gtk.css; the
+ * fallbacks keep it usable on machines without them. */
+
+window.abyss {
+  background-color: var(--hud-bg, #161616);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss .toolbar {
+  padding: 6px 8px;
+  background-color: var(--hud-card, #1c1c1c);
+  border-bottom: 1px solid var(--hud-border, #2a2a2a);
+}
+
+/* Buttons. The GTK theme paints buttons with a background-image gradient
+ * that sits on top of background-color, so every state clears it. */
+window.abyss button,
+window.abyss dropdown > button {
+  border-radius: 10px;
+  min-height: 28px;
+  padding: 2px 12px;
+  background-image: none;
+  background-color: var(--hud-card, #1c1c1c);
+  border: 1px solid var(--hud-border, #2a2a2a);
+  box-shadow: none;
+  color: var(--hud-text, #eeeeee);
+  text-shadow: none;
+}
+
+window.abyss button:hover,
+window.abyss dropdown > button:hover {
+  background-image: none;
+  background-color: var(--hud-track, #262626);
+  border-color: var(--hud-border-accent, #333333);
+}
+
+window.abyss button:active,
+window.abyss button:checked {
+  background-image: none;
+  background-color: var(--hud-border, #2a2a2a);
+}
+
+window.abyss button:focus-visible,
+window.abyss dropdown > button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--hud-accent, #8ab4f8) 70%, transparent);
+  outline-offset: 1px;
+}
+
+window.abyss button:disabled {
+  background-image: none;
+  background-color: transparent;
+  color: var(--hud-faint, #666666);
+}
+
+window.abyss button.flat {
+  background-color: transparent;
+  border-color: transparent;
+}
+
+window.abyss button.flat:hover {
+  background-color: var(--hud-track, #262626);
+  border-color: transparent;
+}
+
+/* Checkboxes: an accent-filled box when ticked. */
+window.abyss checkbutton check {
+  background-image: none;
+  background-color: var(--hud-panel, #101010);
+  border: 1px solid var(--hud-border-accent, #333333);
+  border-radius: 5px;
+  box-shadow: none;
+}
+
+window.abyss checkbutton check:checked {
+  background-color: var(--hud-accent, #8ab4f8);
+  border-color: var(--hud-accent, #8ab4f8);
+  color: var(--hud-bg, #161616);
+}
+
+/* Dropdown list */
+window.abyss dropdown popover > contents {
+  border-radius: 12px;
+  padding: 4px;
+  background-color: var(--hud-card, #1c1c1c);
+  border: 1px solid var(--hud-border-accent, #333333);
+}
+
+window.abyss dropdown popover row {
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+
+window.abyss dropdown popover row:hover {
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss .pathbar button.current {
+  background-color: var(--hud-track, #262626);
+  font-weight: bold;
+}
+
+window.abyss entry {
+  border-radius: 10px;
+  min-height: 30px;
+  background-color: var(--hud-panel, #101010);
+  border: 1px solid var(--hud-border, #2a2a2a);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss entry:focus-within {
+  border-color: var(--hud-accent, #8ab4f8);
+  /* The theme draws focus as a blue outline; use the accent instead. */
+  outline: 1px solid var(--hud-accent, #8ab4f8);
+  outline-offset: -1px;
+}
+
+window.abyss entry,
+window.abyss entry text {
+  caret-color: var(--hud-accent, #8ab4f8);
+}
+
+window.abyss entry text selection {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 45%, transparent);
+  color: var(--hud-text, #eeeeee);
+}
+
+/* Sidebar */
+window.abyss .sidebar {
+  background-color: var(--hud-card, #1c1c1c);
+  padding: 6px;
+}
+
+window.abyss .sidebar row {
+  border-radius: 10px;
+  padding: 5px 10px;
+  margin: 1px 0;
+}
+
+window.abyss .sidebar row:hover {
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss .sidebar row:selected {
+  background-color: var(--hud-accent, #8ab4f8);
+  color: var(--hud-bg, #161616);
+}
+
+window.abyss .sidebar .section {
+  margin: 12px 10px 4px;
+  font-size: 0.8em;
+  font-weight: bold;
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss .sidebar .offline {
+  opacity: 0.45;
+}
+
+window.abyss .sidebar row button {
+  min-height: 20px;
+  padding: 0 4px;
+}
+
+window.abyss paned > separator {
+  background-color: var(--hud-border, #2a2a2a);
+  min-width: 1px;
+}
+
+/* File list */
+window.abyss columnview.files,
+window.abyss columnview.files > listview {
+  background-color: var(--hud-panel, #101010);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss columnview.files > header > button {
+  border-radius: 0;
+  color: var(--hud-dim, #999999);
+  font-size: 0.85em;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--hud-border, #2a2a2a);
+}
+
+window.abyss columnview.files > header > button:hover {
+  background: none;
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss columnview.files > listview > row {
+  border-radius: 10px;
+  margin: 1px 6px;
+}
+
+window.abyss columnview.files > listview > row:hover {
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss columnview.files > listview > row:selected {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 28%, transparent);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss columnview.files .dim-label {
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss .empty {
+  font-size: 1.3em;
+  color: var(--hud-faint, #666666);
+}
+
+/* Bottom bars */
+window.abyss .prompt,
+window.abyss .job {
+  padding: 8px 12px;
+  background-color: var(--hud-card, #1c1c1c);
+  border-top: 1px solid var(--hud-border, #2a2a2a);
+}
+
+window.abyss button.suggested-action,
+window.abyss button.suggested-action:hover {
+  background-image: none;
+  background-color: var(--hud-accent, #8ab4f8);
+  border-color: var(--hud-accent, #8ab4f8);
+  color: var(--hud-bg, #161616);
+  font-weight: bold;
+}
+
+window.abyss button.suggested-action:hover {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 85%, white);
+}
+
+window.abyss button.destructive-action,
+window.abyss button.destructive-action:hover {
+  background-image: none;
+  background-color: #e5534b;
+  border-color: #e5534b;
+  color: #ffffff;
+  font-weight: bold;
+}
+
+window.abyss button.destructive-action:hover {
+  background-color: #ee6b63;
+}
+
+window.abyss progressbar trough {
+  min-height: 8px;
+  border-radius: 99px;
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss progressbar progress {
+  min-height: 8px;
+  border-radius: 99px;
+  background-color: var(--hud-accent, #8ab4f8);
+}
+
+window.abyss .footer {
+  padding: 4px 12px;
+  font-size: 0.85em;
+  color: var(--hud-dim, #999999);
+  background-color: var(--hud-card, #1c1c1c);
+  border-top: 1px solid var(--hud-border, #2a2a2a);
+}
+
+window.abyss .footer .message {
+  color: var(--hud-text, #eeeeee);
+}
+
+/* Menus */
+popover.menu > contents {
+  border-radius: 12px;
+  padding: 4px;
+  background-color: var(--hud-card, #1c1c1c);
+  border: 1px solid var(--hud-border-accent, #333333);
+}
+
+popover.menu button {
+  border-radius: 8px;
+  min-height: 26px;
+  padding: 2px 12px;
+  color: var(--hud-text, #eeeeee);
+}
+
+popover.menu button:hover {
+  background-color: var(--hud-track, #262626);
+}
+
+popover.menu separator {
+  margin: 4px 6px;
+  background-color: var(--hud-border, #2a2a2a);
+}
+
+/* Drag and drop: the folder (row, crumb, sidebar place) a drop would land in */
+window.abyss columnview.files > listview > row cell > *:drop(active),
+window.abyss .pathbar button:drop(active),
+window.abyss .sidebar row:drop(active) {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 35%, transparent);
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+window.abyss columnview.files:drop(active) {
+  box-shadow: inset 0 0 0 2px var(--hud-accent, #8ab4f8);
+}
+
+/* Between the bookmarks and Trash; tall, with room below, so a drop
+ * meant for it doesn't land on Trash. */
+window.abyss .sidebar row.bookmark-drop-row,
+window.abyss .sidebar row.bookmark-drop-row:hover {
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  background: none;
+}
+
+/* Margins live inside the revealer so the collapsed row takes no space. */
+window.abyss .bookmark-drop {
+  min-height: 52px;
+  margin: 6px 0 14px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 2px dashed var(--hud-faint, #666666);
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss .sidebar row.bookmark-drop-row:drop(active) {
+  background: none;
+}
+
+window.abyss row.bookmark-drop-row:drop(active) .bookmark-drop {
+  border-color: var(--hud-accent, #8ab4f8);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss .sidebar .synced-badge {
+  color: var(--hud-dim, #999999);
+  -gtk-icon-size: 12px;
+}
+
+window.abyss .sidebar row:selected .synced-badge {
+  color: inherit;
+}
+
+/* Sidebar reordering: a line where the dragged row will land */
+window.abyss .sidebar row.drop-above {
+  box-shadow: inset 0 2px 0 0 var(--hud-accent, #8ab4f8);
+}
+
+window.abyss .sidebar row.drop-below {
+  box-shadow: inset 0 -2px 0 0 var(--hud-accent, #8ab4f8);
+}
+
+window.abyss .conflict .conflict-title {
+  font-weight: bold;
+}
+
+window.abyss .conflict checkbutton {
+  color: var(--hud-dim, #999999);
+}
+
+/* Open With chooser */
+window.abyss.chooser .chooser-body {
+  padding: 14px;
+}
+
+window.abyss.chooser .sidebar {
+  border-radius: 10px;
+}
+
+/* Job bar: a small round stop button, not a big grey box */
+/* Size and percentage next to the progress bar: fixed-width digits so the
+   text doesn't jitter as the numbers change. */
+window.abyss .job-amount {
+  color: var(--hud-dim, #999999);
+  font-feature-settings: "tnum";
+  margin: 0 4px;
+}
+
+window.abyss button.job-cancel {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px;
+  border-radius: 99px;
+  background: none;
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss button.job-cancel:hover {
+  background-color: color-mix(in srgb, #e5534b 25%, transparent);
+  color: #e5534b;
+}
+
+/* Sign-in bar */
+window.abyss .auth entry,
+window.abyss .auth passwordentry {
+  min-height: 30px;
+}
+
+window.abyss .auth checkbutton {
+  color: var(--hud-dim, #999999);
+}
+
+/* The octopus at the bottom of the sidebar: a faint accent silhouette. */
+window.abyss .sidebar-logo {
+  color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 38%, transparent);
+  margin: 24px 0 28px;
+}
+
+/* File list zoom: the icon (or thumbnail) size per level. */
+window.abyss .views.zoom-20 columnview .file-icon { -gtk-icon-size: 20px; }
+window.abyss .views.zoom-20 gridview .file-icon { -gtk-icon-size: 48px; }
+window.abyss .views.zoom-32 columnview .file-icon { -gtk-icon-size: 32px; }
+window.abyss .views.zoom-32 gridview .file-icon { -gtk-icon-size: 64px; }
+window.abyss .views.zoom-48 columnview .file-icon { -gtk-icon-size: 48px; }
+window.abyss .views.zoom-48 gridview .file-icon { -gtk-icon-size: 96px; }
+window.abyss .views.zoom-64 columnview .file-icon { -gtk-icon-size: 64px; }
+window.abyss .views.zoom-64 gridview .file-icon { -gtk-icon-size: 128px; }
+window.abyss .views.zoom-96 columnview .file-icon { -gtk-icon-size: 96px; }
+window.abyss .views.zoom-96 gridview .file-icon { -gtk-icon-size: 160px; }
+window.abyss .views.zoom-128 columnview .file-icon { -gtk-icon-size: 128px; }
+window.abyss .views.zoom-128 gridview .file-icon { -gtk-icon-size: 192px; }
+
+
+/* Grid tiles: icon or thumbnail over a two-line name. */
+window.abyss gridview.files {
+  background-color: var(--hud-panel, #101010);
+  padding: 8px;
+}
+
+/* The look sits on the tile, not on GTK's cell: in the grouped grid some
+   cells are headings or empty fillers, which have no tile and so no
+   padding, hover or selection. (Cell state still reaches the tile.) */
+window.abyss gridview.files > child,
+window.abyss gridview.files > child:hover,
+window.abyss gridview.files > child:selected {
+  background: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* Adwaita gives every box in a grid cell a 12px margin, which put 24px of
+   empty space around each tile (and again around its thumbnail slot). */
+window.abyss gridview.files > child box {
+  margin: 0;
+  border-spacing: 6px;
+}
+
+window.abyss gridview.files > child .tile {
+  border-radius: 12px;
+  padding: 10px 6px 8px;
+  margin: 2px;
+}
+
+window.abyss gridview.files > child:hover .tile {
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss gridview.files > child:selected .tile {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 28%, transparent);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss .tile label {
+  font-size: 0.92em;
+}
+
+/* Grouped views: a heading per file type, with its count. In the grouped
+   grid the heading is the first cell of a row of its own. */
+window.abyss .group-heading {
+  padding: 14px 16px 4px;
+}
+
+window.abyss gridview.files > child .group-heading {
+  padding: 14px 8px 4px;
+}
+
+window.abyss .group-name {
+  font-weight: bold;
+  color: var(--hud-accent, #8ab4f8);
+}
+
+window.abyss .group-count {
+  color: var(--hud-faint, #666666);
+}
+
+window.abyss columnview.files > listview > header {
+  background: none;
+  border: none;
+}
+
+/* View switch next to the filter: the active mode is filled. */
+window.abyss .view-switch > button,
+window.abyss button.view-switch {
+  min-width: 30px;
+  padding: 2px 8px;
+}
+
+/* The outline is drawn inside the button: the joined pair shares one border
+   between its halves, so a border colour would lose the right button's left
+   edge (and the left button would look different from the right). */
+window.abyss .view-switch > button:checked,
+window.abyss button.view-switch:checked {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 30%, transparent);
+  box-shadow: inset 0 0 0 1px var(--hud-accent, #8ab4f8);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss .linked.view-switch > button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+window.abyss .linked.view-switch > button:last-child {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left-width: 0;
+}

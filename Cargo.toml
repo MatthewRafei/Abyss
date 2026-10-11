@@ -1,0 +1,41 @@
+[package]
+name = "abyss"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal file browser, rebuilt in Rust from Nautilus logic"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+glib = { version = "0.22", features = ["v2_72"] }
+gio = { version = "0.22", features = ["v2_72"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-channel = "0.3"
+
+# Speed first; symbols stripped for size. CPU and linker hardening flags
+# live in .cargo/config.toml.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = "deny"
+missing_docs = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+# GTK is single-threaded: every future runs on the main context via
+# spawn_future_local and holds GObjects, which are !Send by design.
+future_not_send = "allow"

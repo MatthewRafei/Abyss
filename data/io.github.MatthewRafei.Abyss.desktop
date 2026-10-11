@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Abyss
+GenericName=File Browser
+Comment=Browse local, network and synced files
+Exec=abyss %U
+Icon=io.github.MatthewRafei.Abyss
+Terminal=false
+StartupNotify=true
+Categories=GTK;System;FileTools;FileManager;Core;
+MimeType=inode/directory;
+Keywords=folder;files;browser;network;smb;sftp;

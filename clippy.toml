@@ -1,0 +1,5 @@
+# Tests may unwrap: a panic there is the failure report.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# Product names, not code identifiers.
+doc-valid-idents = ["GVfs", "GLib", "ImageMagick", "KeePassXC", ".."]
