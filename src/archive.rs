@@ -145,7 +145,8 @@ async fn bsdtar(
         let reader = gio::DataInputStream::new(&pipe);
         while let Ok(Some(text)) = reader.read_line_utf8_future(glib::Priority::DEFAULT).await {
             line(&text);
-            if !text.starts_with("x ") {
+            // "x name" / "a name": each entry extracted / added (-v).
+            if !text.starts_with("x ") && !text.starts_with("a ") {
                 errors.push_str(&text);
                 errors.push('\n');
             }
@@ -327,6 +328,101 @@ async fn settle(
     Ok(target)
 }
 
+/// Formats Compress offers, as (label, extension); bsdtar picks the format
+/// from the extension.
+pub const FORMATS: [(&str, &str); 5] = [
+    ("Zip", ".zip"),
+    ("Tar + gzip", ".tar.gz"),
+    ("Tar + xz", ".tar.xz"),
+    ("Tar + zstd", ".tar.zst"),
+    ("7-Zip", ".7z"),
+];
+
+/// Packs `files` into a new archive `dest` (its extension picks the format).
+/// It's written in a temporary folder beside `dest` and moved there when
+/// complete, so a stopped job leaves no half-written archive behind.
+pub async fn compress(
+    files: &[gio::File],
+    dest: &gio::File,
+    report: &ops::Report,
+) -> Result<gio::File, Error> {
+    let Some(dest_path) = dest.path() else {
+        return Err(fail("Compressing needs a local or mounted destination"));
+    };
+    let Some(dir) = dest_path.parent() else {
+        return Err(fail("Compressing needs a folder to put the archive in"));
+    };
+    let mut sources = Vec::with_capacity(files.len());
+    for file in files {
+        let (Some(path), Some(parent)) = (file.path(), file.parent().and_then(|p| p.path())) else {
+            return Err(fail(
+                "Compressing needs the files on a local or mounted path",
+            ));
+        };
+        let name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        sources.push((parent, name));
+    }
+    let tmp = dir.join(format!(
+        ".abyss-compress-{}-{}",
+        std::process::id(),
+        glib::monotonic_time()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|e| fail(format!("Couldn't create a temporary folder: {e}")))?;
+    let mut cleanup = Cleanup {
+        process: None,
+        tmp: tmp.clone(),
+        armed: true,
+    };
+    let out = tmp.join(dest_path.file_name().unwrap_or_default());
+
+    let (_, total) = ops::count(files).await;
+    let mut progress = ops::Progress {
+        total_files: total,
+        current: ops::display_name(dest),
+        ..Default::default()
+    };
+    report(&progress);
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "-c".as_ref(),
+        "-a".as_ref(),
+        "-v".as_ref(),
+        "-f".as_ref(),
+        out.as_os_str(),
+    ];
+    // Each item from its own folder (search results can come from many).
+    for (parent, name) in &sources {
+        args.extend(["-C".as_ref(), parent.as_os_str(), name.as_os_str()]);
+    }
+    let result = bsdtar(&args, &mut cleanup, |line| {
+        if let Some(entry) = line.strip_prefix("a ") {
+            progress.done_files += 1;
+            entry
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(entry)
+                .clone_into(&mut progress.current);
+            report(&progress);
+        }
+    })
+    .await;
+    if let Err(stderr) = result {
+        let first = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("Compressing failed");
+        return Err(fail(first.trim()));
+    }
+    std::fs::rename(&out, &dest_path).map_err(|e| fail(e.to_string()))?;
+    let _ = std::fs::remove_dir(&tmp);
+    cleanup.armed = false;
+    Ok(dest.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +486,53 @@ mod tests {
                     e.file_name()
                         .to_string_lossy()
                         .starts_with(".abyss-extract")
+                });
+            assert!(!leftovers);
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compress_round_trips() {
+        if !have_bsdtar() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("abyss-compress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/top")).unwrap();
+        std::fs::write(dir.join("src/top/a.txt"), "a").unwrap();
+        std::fs::write(dir.join("src/b.txt"), "b").unwrap();
+        let quiet: ops::Report = Rc::new(|_| {});
+        let f = |p: &str| gio::File::for_path(dir.join(p));
+        run(async {
+            for (_, ext) in FORMATS {
+                let name = format!("pack{ext}");
+                let made = compress(&[f("src/top"), f("src/b.txt")], &f(&name), &quiet)
+                    .await
+                    .ok()
+                    .unwrap();
+                assert_eq!(ops::display_name(&made), name);
+                let out = dir.join(format!("out{ext}"));
+                std::fs::create_dir_all(&out).unwrap();
+                let ok = std::process::Command::new("bsdtar")
+                    .arg("-xf")
+                    .arg(dir.join(&name))
+                    .arg("-C")
+                    .arg(&out)
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "{ext}");
+                assert_eq!(std::fs::read_to_string(out.join("top/a.txt")).unwrap(), "a");
+                assert_eq!(std::fs::read_to_string(out.join("b.txt")).unwrap(), "b");
+            }
+            let leftovers = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".abyss-compress")
                 });
             assert!(!leftovers);
         });

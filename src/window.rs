@@ -1,6 +1,8 @@
-//! The browser window: sidebar, path bar, file list, prompt bar and footer.
-//! Behaviour borrowed from nautilus-window-slot.c (history, mounting on
-//! demand), nautilus-pathbar.c and nautilus-files-view.c (menus, clipboard).
+//! The browser window: sidebar, toolbar and path bar, one or two panes of
+//! tabs (`panes.rs`, `tab.rs`), prompt bar and footer. The toolbar, menus,
+//! keys and footer act on the active tab. Behaviour borrowed from
+//! nautilus-window-slot.c (history, mounting on demand), nautilus-pathbar.c
+//! and nautilus-files-view.c (menus, clipboard).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,7 +24,25 @@ use crate::places::{self, Pin, Place, Section, Target};
 use crate::search;
 use crate::thumbs;
 
+// The window's child modules share its helpers wholesale.
+#[allow(clippy::wildcard_imports)]
+mod batch_rename;
+mod error_bar;
+#[allow(clippy::wildcard_imports)]
+mod panes;
+#[allow(clippy::wildcard_imports)]
+mod prefs_ui;
+#[allow(clippy::wildcard_imports)]
+mod properties;
+#[allow(clippy::wildcard_imports)]
+mod servers;
+#[allow(clippy::wildcard_imports)]
+mod tab;
+#[allow(clippy::wildcard_imports)]
+mod undo;
+#[allow(clippy::wildcard_imports)]
 mod views;
+use tab::Tab;
 use views::Mode;
 
 type PromptAction = Box<dyn Fn(&Rc<Win>, String)>;
@@ -35,6 +55,7 @@ pub struct Win {
     peers_checked: Cell<Option<std::time::Instant>>,
     monitor: gio::VolumeMonitor,
 
+    // The toolbar: it acts on the active tab.
     path_stack: gtk::Stack,
     pathbar: gtk::Box,
     location: gtk::Entry,
@@ -42,51 +63,37 @@ pub struct Win {
     back_btn: gtk::Button,
     forward_btn: gtk::Button,
     up_btn: gtk::Button,
-
-    view: gtk::ColumnView,
-    /// Pages "list", "grid" and "groups" (grouped grid); carries the zoom class.
-    views: gtk::Stack,
-    grid: gtk::GridView,
-    /// The grouped grid: one grid over `grouped_model`'s layout.
-    groups: gtk::GridView,
-    grouped_model: crate::section::GroupedSelection,
-    /// The running column check of the grouped grid, if any.
-    group_tick: RefCell<Option<gtk::TickCallbackId>>,
     list_btn: gtk::ToggleButton,
     grid_btn: gtk::ToggleButton,
     group_btn: gtk::ToggleButton,
+    split_btn: gtk::ToggleButton,
+    /// The view mode, shared by every tab.
     mode: Cell<Mode>,
-    /// Shared with the group sorter, which only sorts while grouped.
+    /// Shared with the tabs' group sorters, which only sort while grouped.
     grouped: Rc<Cell<bool>>,
-    group_sorter: gtk::NumericSorter,
-    folders_first: gtk::NumericSorter,
     toolbar_row1: gtk::Box,
     toolbar_row2: gtk::Box,
     controls: gtk::Box,
     compact: Cell<bool>,
+    /// Reports the file area's width (drives the toolbar layout).
     size_probe: gtk::DrawingArea,
-    /// The shown folder's listing; `filtered` reads it, or search results.
-    list: RefCell<gtk::DirectoryList>,
-    /// Listings of folders visited lately, most recent first, kept loaded
-    /// (and watched) so going back to one is instant.
-    recent: RefCell<VecDeque<gtk::DirectoryList>>,
-    filtered: gtk::FilterListModel,
-    filter: gtk::CustomFilter,
-    /// The search term, lowercased once per keystroke.
-    needle: RefCell<String>,
-    /// Shown files waiting for their full type, and whether a lookup runs.
-    untyped: RefCell<Vec<gio::FileInfo>>,
-    typing: Cell<bool>,
-    /// The recursive search under the current folder, if one is running.
-    search_task: RefCell<Option<glib::JoinHandle<()>>>,
-    search_state: Cell<SearchState>,
-    sorted: gtk::SortListModel,
-    selection: gtk::MultiSelection,
-    empty: gtk::Label,
+
+    /// Left and right pane; the right one shows while split.
+    panes: [panes::Pane; 2],
+    panes_paned: gtk::Paned,
+    active_pane: Cell<usize>,
+    split: Cell<bool>,
+    /// Closed tabs (pane, location), newest last, for Ctrl+Shift+T.
+    closed: RefCell<Vec<(usize, gio::File)>>,
+    session_pending: Cell<bool>,
+    /// Restoring the session (nothing to save meanwhile).
+    restoring: Cell<bool>,
 
     prompt: gtk::Revealer,
     prompt_label: gtk::Label,
     prompt_entry: gtk::Entry,
+    /// Extra controls a prompt adds (Compress's format), cleared after.
+    prompt_extra: gtk::Box,
     prompt_ok: gtk::Button,
     prompt_action: RefCell<Option<PromptAction>>,
 
@@ -113,16 +120,22 @@ pub struct Win {
     busy: Cell<bool>,
 
     status: gtk::Label,
-    status_pending: Cell<bool>,
     message: gtk::Label,
     message_seq: Rc<Cell<u32>>,
+    /// Failures slide up in a bar of their own (`show_error`).
+    errors: Rc<error_bar::ErrorBar>,
+    /// Operations that can be undone, oldest first (see `undo.rs`).
+    undo_steps: RefCell<Vec<undo::Step>>,
+    undo_btn: gtk::Button,
+    undo_seq: Rc<Cell<u32>>,
+    /// Batch rename, a bar like the sign-in bar.
+    batch: Rc<batch_rename::Bar>,
 
-    current: RefCell<gio::File>,
-    back: RefCell<Vec<gio::File>>,
-    forward: RefCell<Vec<gio::File>>,
     show_hidden: Cell<bool>,
     /// Index into `ZOOM_LEVELS` for the file list's icon size.
     zoom: Cell<usize>,
+    /// When Ctrl+scroll last stepped the zoom (one level per notch).
+    zoom_step_at: Cell<Option<std::time::Instant>>,
     /// Folder-under-drag timer (open after `HOVER_TIMEOUT_MS`).
     hover_timer: RefCell<Option<glib::SourceId>>,
     hover_start: Cell<(f64, f64)>,
@@ -137,6 +150,18 @@ pub struct Win {
     clip: RefCell<Option<(Vec<gio::File>, bool)>>,
 }
 
+/// What holding a drag over a drop target for a moment does.
+#[derive(Clone)]
+pub enum HoverOpen {
+    No,
+    /// Opens the folder in the active tab (path bar crumbs).
+    Active,
+    /// Opens the folder in this tab (its folder rows).
+    Tab(Weak<Tab>),
+    /// Switches to this tab (its strip entry).
+    Select(Weak<Tab>),
+}
+
 fn info_file(obj: &glib::Object) -> Option<gio::File> {
     obj.downcast_ref::<gio::FileInfo>()?
         .attribute_object("standard::file")?
@@ -149,7 +174,7 @@ type WinAction = Box<dyn Fn(&Rc<Win>)>;
 
 /// Where the recursive search under the current folder stands.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SearchState {
+pub enum SearchState {
     /// Not searching subfolders; the list is the folder's own.
     Off,
     Running,
@@ -164,21 +189,18 @@ const RECENT_FILES: u32 = 25_000;
 /// A recursive search starts from this many characters.
 const SEARCH_MIN_CHARS: usize = 2;
 
-fn new_list() -> gtk::DirectoryList {
-    // Attributes are set per folder (`info::attributes`) before listing.
-    let list = gtk::DirectoryList::new(None, None::<&gio::File>);
-    list.set_io_priority(glib::Priority::LOW);
-    list
-}
-
 /// Whether a folder's listing stays correct while kept in memory: local
-/// folders, whose changes inotify reports. Remote ones, and gvfs's FUSE
-/// mirror of them, get no change events, so they're always read afresh.
+/// folders, whose changes inotify reports. Remote ones get no change events
+/// for what other machines do: gvfs locations, and network shares mounted
+/// into the tree (SMB/NFS, sshfs), so they're always read afresh.
 fn keeps_fresh(file: &gio::File) -> bool {
     let Some(path) = file.path().filter(|_| file.is_native()) else {
         return false;
     };
     !path.starts_with(glib::user_runtime_dir().join("gvfs"))
+        && file
+            .query_filesystem_info("filesystem::remote", gio::Cancellable::NONE)
+            .is_ok_and(|fs| !fs.boolean("filesystem::remote"))
 }
 
 /// An expression for GTK's keyed sorters, which evaluate it once per file
@@ -335,6 +357,35 @@ fn fitted(texture: &gdk::Texture, width: i32, height: i32) -> gdk::Paintable {
         .unwrap_or_else(|| texture.clone().upcast())
 }
 
+thread_local! {
+    /// When a file view last scrolled fast. Thumbnails wait for that to
+    /// settle: a fling through thousands of files would otherwise look up
+    /// and decode every one it passes.
+    static FLUNG: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Notes fast scrolls of `adj` (several screens a second), which hold back
+/// thumbnail loading; reading along at a calm pace doesn't.
+fn watch_scroll(adj: &gtk::Adjustment) {
+    let last = Cell::new((adj.value(), std::time::Instant::now()));
+    adj.connect_value_changed(move |adj| {
+        let now = std::time::Instant::now();
+        let (was, then) = last.replace((adj.value(), now));
+        let secs = now.duration_since(then).as_secs_f64().max(0.001);
+        if (adj.value() - was).abs() / secs > adj.page_size().max(1.0) * 4.0 {
+            FLUNG.set(Some(now));
+        }
+    });
+}
+
+/// Resolves once no view has scrolled fast for a moment.
+async fn scroll_settled() {
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+    while let Some(left) = FLUNG.get().and_then(|t| SETTLE.checked_sub(t.elapsed())) {
+        glib::timeout_future(left).await;
+    }
+}
+
 /// Shows the file's thumbnail once it's available, generating it if
 /// needed: in `picture` when given (grid tiles, where it fills the wide
 /// slot that is the picture's parent), else in place of `image`'s icon.
@@ -352,6 +403,15 @@ fn show_thumbnail(image: &gtk::Image, picture: Option<&gtk::Picture>, info: &gio
     let slot = image.as_ptr() as usize;
     if let Some((_, old)) = WAITING.with_borrow_mut(|w| w.remove(&slot)) {
         old.abort();
+    }
+    // Thumbnails turned off: the icon stays.
+    if !crate::prefs::get().thumbnails {
+        if let Some(picture) = picture {
+            picture.set_paintable(None::<&gdk::Paintable>);
+            picture.set_visible(false);
+            image.set_visible(true);
+        }
+        return;
     }
     // A recycled tile starts with the icon until its own thumbnail is in.
     if let Some(picture) = picture {
@@ -381,16 +441,19 @@ fn show_thumbnail(image: &gtk::Image, picture: Option<&gtk::Picture>, info: &gio
     let info = info.clone();
     let id = NEXT.replace(NEXT.get() + 1);
     let handle = glib::spawn_future_local(async move {
-        let found = thumbs::thumbnail(&file, &info).await;
+        // A tile flung past is recycled meanwhile, which drops this wait.
+        scroll_settled().await;
+        let found = match thumbs::thumbnail(&file, &info).await {
+            Some(path) => thumbs::texture(path, px).await,
+            None => None,
+        };
+        // Waiting until the decode is in too lets a recycled tile cancel it.
         WAITING.with_borrow_mut(|w| {
             if w.get(&slot).is_some_and(|(n, _)| *n == id) {
                 w.remove(&slot);
             }
         });
-        let Some(path) = found else {
-            return;
-        };
-        let Some(texture) = thumbs::texture(path, px).await else {
+        let Some(texture) = found else {
             return;
         };
         let Some(image) = image.upgrade().filter(|i| i.widget_name() == uri) else {
@@ -506,6 +569,7 @@ fn root_label(file: &gio::File) -> String {
         Some("trash") => "Trash".into(),
         Some("network") => "Network".into(),
         Some("recent") => "Recent".into(),
+        Some("starred") => "Starred".into(),
         Some("file") => "Filesystem".into(),
         _ => glib::Uri::parse(&uri, glib::UriFlags::NONE)
             .ok()
@@ -515,6 +579,13 @@ fn root_label(file: &gio::File) -> String {
 }
 
 fn terminal() -> Option<String> {
+    // Preferences first: the whole command; its program must exist.
+    let chosen = crate::prefs::get().terminal;
+    if let Some(program) = chosen.split_whitespace().next() {
+        if places::have_command(program) {
+            return Some(chosen);
+        }
+    }
     std::env::var("TERMINAL")
         .ok()
         .filter(|t| places::have_command(t))
@@ -528,10 +599,17 @@ fn terminal() -> Option<String> {
 
 impl Win {
     pub fn open(app: &gtk::Application, start: Option<gio::File>) {
-        let win = Self::build(app);
-        Self::wire(&win);
-        let start = start.unwrap_or_else(|| gio::File::for_path(glib::home_dir()));
-        win.navigate(start, false);
+        // Only the first window picks up the last session, and only when
+        // no location was asked for.
+        let first = app.windows().is_empty();
+        let (win, adds) = Self::build(app);
+        Self::wire(&win, adds);
+        let restored =
+            start.is_none() && first && crate::prefs::get().restore_tabs && win.restore_session();
+        if !restored {
+            let start = start.unwrap_or_else(|| gio::File::for_path(glib::home_dir()));
+            win.open_tab(0, start, true);
+        }
         win.refresh_sidebar();
         win.refresh_peers();
         // Callbacks only hold weak refs; the window owns the state.
@@ -540,11 +618,12 @@ impl Win {
             keep.take();
         });
         win.window.present();
+        win.focus_view();
     }
 
     // Builds the whole widget tree; splitting it would just scatter it.
     #[allow(clippy::too_many_lines)]
-    fn build(app: &gtk::Application) -> Rc<Self> {
+    fn build(app: &gtk::Application) -> (Rc<Self>, [gtk::Button; 2]) {
         let window = gtk::ApplicationWindow::builder()
             .application(app)
             .title("Abyss")
@@ -602,9 +681,15 @@ impl Win {
             .tooltip_text("Group by type")
             .build();
         group_btn.add_css_class("view-switch");
+        let split_btn = gtk::ToggleButton::builder()
+            .icon_name("view-dual-symbolic")
+            .tooltip_text("Split view (F3)")
+            .build();
+        split_btn.add_css_class("view-switch");
         // View controls and filter: on the path's row, or a row of their own
         // under it when the window is narrow (see update_toolbar_layout).
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        controls.append(&split_btn);
         controls.append(&switch);
         controls.append(&group_btn);
         controls.append(&search);
@@ -645,10 +730,15 @@ impl Win {
         logo.add_css_class("sidebar-logo");
         logo.set_vexpand(true);
         logo.set_valign(gtk::Align::End);
-        logo.set_visible(
-            gdk::Display::default()
-                .is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(logo_name)),
-        );
+        // Looked for where install.sh puts it: `has_icon` would first read
+        // every icon name of every installed theme, half of startup.
+        let logo_file = format!("hicolor/scalable/apps/{logo_name}.svg");
+        logo.set_visible(gdk::Display::default().is_some_and(|d| {
+            gtk::IconTheme::for_display(&d)
+                .search_path()
+                .iter()
+                .any(|dir| dir.join(&logo_file).exists())
+        }));
         side_box.append(&logo);
         let side_scroll = gtk::ScrolledWindow::builder()
             .child(&side_box)
@@ -656,71 +746,26 @@ impl Win {
             .width_request(210)
             .build();
 
-        // File list: DirectoryList -> filter -> sort -> selection.
-        let list = new_list();
-        let filter = gtk::CustomFilter::new(|_| true);
-        let filtered = gtk::FilterListModel::new(Some(list.clone()), Some(filter.clone()));
-        let sorted = gtk::SortListModel::new(Some(filtered.clone()), None::<gtk::Sorter>);
-        let selection = gtk::MultiSelection::new(Some(sorted.clone()));
-        let view = gtk::ColumnView::new(Some(selection.clone()));
-        view.add_css_class("files");
-        view.set_show_column_separators(false);
-        let empty = gtk::Label::new(Some("Nothing here"));
-        empty.add_css_class("empty");
-        empty.set_visible(false);
-        let view_scroll = gtk::ScrolledWindow::builder()
-            .child(&view)
-            .vexpand(true)
-            .build();
-        let grid = gtk::GridView::new(Some(selection.clone()), None::<gtk::ListItemFactory>);
-        grid.add_css_class("files");
-        grid.set_max_columns(24);
-        // No sideways scrolling: the grid wraps to the window's width.
-        let grid_scroll = gtk::ScrolledWindow::builder()
-            .child(&grid)
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        let grouped_model = crate::section::GroupedSelection::new(&selection, |item| {
-            item.downcast_ref::<gio::FileInfo>()
-                .map_or("Other", |info| views::category(info).1)
-        });
-        let groups = gtk::GridView::new(Some(grouped_model.clone()), None::<gtk::ListItemFactory>);
-        groups.add_css_class("files");
-        groups.add_css_class("groups");
-        let groups_scroll = gtk::ScrolledWindow::builder()
-            .child(&groups)
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        let views = gtk::Stack::new();
-        views.add_css_class("views");
-        views.add_css_class(&format!("zoom-{}", ZOOM_LEVELS[load_zoom()]));
-        views.add_named(&view_scroll, Some("list"));
-        views.add_named(&grid_scroll, Some("grid"));
-        views.add_named(&groups_scroll, Some("groups"));
+        // Panes of tabs, side by side while split.
+        let (left, add_left) = panes::Pane::new();
+        let (right, add_right) = panes::Pane::new();
+        right.root.set_visible(false);
+        let panes_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        panes_paned.set_start_child(Some(&left.root));
+        panes_paned.set_end_child(Some(&right.root));
+        panes_paned.set_shrink_start_child(false);
+        panes_paned.set_shrink_end_child(false);
+        panes_paned.set_vexpand(true);
+        panes_paned.add_css_class("panes");
         let (start_mode, start_grouped) = views::load_view();
-        let grouped = Rc::new(Cell::new(start_grouped));
-        let g = grouped.clone();
-        let group_sorter = gtk::NumericSorter::new(Some(info_key(move |info| {
-            if g.get() {
-                u32::from(views::category(info).0)
-            } else {
-                0
-            }
-        })));
-        let folders_first =
-            gtk::NumericSorter::new(Some(info_key(|info| u32::from(!is_dir(info)))));
-        let view_overlay = gtk::Overlay::new();
-        view_overlay.set_child(Some(&views));
-        view_overlay.add_overlay(&empty);
+        let panes_overlay = gtk::Overlay::new();
+        panes_overlay.set_child(Some(&panes_paned));
         // An invisible, click-through layer over the file area: GTK reports
         // its size on every allocation, which drives the toolbar layout.
         let size_probe = gtk::DrawingArea::new();
         size_probe.set_can_target(false);
         size_probe.set_can_focus(false);
-        view_overlay.add_overlay(&size_probe);
-        empty.set_can_target(false);
+        panes_overlay.add_overlay(&size_probe);
 
         // Prompt bar (rename, new folder, confirmations).
         let prompt_label = gtk::Label::new(None);
@@ -732,6 +777,8 @@ impl Win {
         prompt_box.add_css_class("prompt");
         prompt_box.append(&prompt_label);
         prompt_box.append(&prompt_entry);
+        let prompt_extra = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        prompt_box.append(&prompt_extra);
         prompt_box.append(&prompt_cancel);
         prompt_box.append(&prompt_ok);
         let prompt = gtk::Revealer::builder()
@@ -813,11 +860,20 @@ impl Win {
         footer.add_css_class("footer");
         footer.append(&status);
         footer.append(&message);
+        let undo_btn = gtk::Button::with_label("Undo");
+        undo_btn.add_css_class("flat");
+        undo_btn.add_css_class("undo");
+        undo_btn.set_visible(false);
+        footer.append(&undo_btn);
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
         main.append(&toolbar);
-        main.append(&view_overlay);
+        main.append(&panes_overlay);
         main.append(&prompt);
+        let errors = error_bar::ErrorBar::new();
+        main.append(errors.widget());
+        let batch = batch_rename::Bar::new();
+        main.append(batch.widget());
         let auth = auth::AuthBar::new();
         main.append(auth.widget());
         main.append(&conflict);
@@ -832,7 +888,6 @@ impl Win {
         paned.set_position(220);
         window.set_child(Some(&paned));
 
-        let home = gio::File::for_path(glib::home_dir());
         let win = Rc::new(Self {
             window,
             sidebar,
@@ -847,39 +902,28 @@ impl Win {
             back_btn,
             forward_btn,
             up_btn,
-            view,
-            views,
-            grid,
-            groups,
-            grouped_model,
-            group_tick: RefCell::default(),
             list_btn,
             grid_btn,
             group_btn,
+            split_btn,
             mode: Cell::new(start_mode),
-            grouped,
-            group_sorter,
-            folders_first,
+            grouped: Rc::new(Cell::new(start_grouped)),
             toolbar_row1: header,
             toolbar_row2,
             controls,
             compact: Cell::new(false),
             size_probe,
-            list: RefCell::new(list),
-            recent: RefCell::default(),
-            filtered,
-            filter,
-            needle: RefCell::default(),
-            untyped: RefCell::default(),
-            typing: Cell::new(false),
-            search_task: RefCell::default(),
-            search_state: Cell::new(SearchState::Off),
-            sorted,
-            selection,
-            empty,
+            panes: [left, right],
+            panes_paned,
+            active_pane: Cell::new(0),
+            split: Cell::new(false),
+            closed: RefCell::default(),
+            session_pending: Cell::new(false),
+            restoring: Cell::new(false),
             prompt,
             prompt_label,
             prompt_entry,
+            prompt_extra,
             prompt_ok,
             prompt_action: RefCell::default(),
             job,
@@ -899,14 +943,16 @@ impl Win {
             auth,
             busy: Cell::new(false),
             status,
-            status_pending: Cell::new(false),
             message,
             message_seq: Rc::default(),
-            current: RefCell::new(home),
-            back: RefCell::default(),
-            forward: RefCell::default(),
-            show_hidden: Cell::new(false),
+            errors,
+            undo_steps: RefCell::default(),
+            undo_btn,
+            undo_seq: Rc::default(),
+            batch,
+            show_hidden: Cell::new(crate::prefs::get().show_hidden),
             zoom: Cell::new(load_zoom()),
+            zoom_step_at: Cell::new(None),
             hover_timer: RefCell::default(),
             hover_start: Cell::new((0.0, 0.0)),
             bookmark_drop,
@@ -980,397 +1026,45 @@ impl Win {
             glib::Propagation::Proceed
         });
         win.conflict.add_controller(keys);
-        win
+        (win, [add_left, add_right])
     }
 
-    fn wire(win: &Rc<Self>) {
-        Self::setup_columns(win);
+    fn wire(win: &Rc<Self>, adds: [gtk::Button; 2]) {
+        Self::setup_panes(win, adds);
         Self::setup_views(win);
         Self::setup_filter(win);
         Self::setup_navigation(win);
         Self::setup_sidebar(win);
         Self::setup_prompt(win);
         Self::setup_shortcuts(win);
-        Self::setup_background_menu(win);
-        Self::setup_scroll_zoom(win);
         Self::setup_dnd(win);
+        Self::setup_batch_rename(win);
+        // Sort beside the view switches, the menu last.
+        win.controls.insert_child_after(
+            &Self::sort_menu_button(win),
+            win.search.prev_sibling().as_ref(),
+        );
+        win.controls.append(&Self::main_menu_button(win));
+        let w = Rc::downgrade(win);
+        win.undo_btn.connect_clicked(move |_| {
+            if let Some(win) = w.upgrade() {
+                win.undo();
+            }
+        });
     }
 
     // ------------------------------------------------------------ columns --
 
-    #[allow(clippy::too_many_lines)]
-    fn setup_columns(win: &Rc<Self>) {
-        let w = Rc::downgrade(win);
-
-        let name_factory = gtk::SignalListItemFactory::new();
-        name_factory.connect_setup(move |_, item| {
-            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let image = gtk::Image::new();
-            image.add_css_class("file-icon");
-            track_icon(&image);
-            let label = gtk::Label::new(None);
-            label.set_xalign(0.0);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            row.append(&image);
-            row.append(&label);
-            item.set_child(Some(&row));
-            Self::attach_item_menu(&w, item, &row, false);
-            Self::attach_item_dnd(&w, item, &row, false);
-        });
-        name_factory.connect_bind(|_, item| {
-            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let Some(info) = item.item().and_downcast::<gio::FileInfo>() else {
-                return;
-            };
-            let Some(row) = item.child().and_downcast::<gtk::Box>() else {
-                return;
-            };
-            let (Some(image), Some(label)) = (
-                row.first_child().and_downcast::<gtk::Image>(),
-                row.last_child().and_downcast::<gtk::Label>(),
-            ) else {
-                return;
-            };
-            image.set_from_gicon(&crate::info::icon(&info));
-            show_thumbnail(&image, None, &info);
-            match hit_markup(&info) {
-                Some(markup) => label.set_markup(&markup),
-                None => label.set_text(&info.display_name()),
-            }
-            row.set_opacity(if is_hidden(&info) { 0.6 } else { 1.0 });
-        });
-
-        let text_factory = |w: Weak<Self>, f: fn(&gio::FileInfo) -> String| {
-            let factory = gtk::SignalListItemFactory::new();
-            factory.connect_setup(move |_, item| {
-                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-                    return;
-                };
-                let label = gtk::Label::new(None);
-                label.set_xalign(0.0);
-                label.add_css_class("dim-label");
-                item.set_child(Some(&label));
-                Self::attach_item_menu(&w, item, &label, false);
-                Self::attach_item_dnd(&w, item, &label, false);
-            });
-            factory.connect_bind(move |_, item| {
-                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
-                    return;
-                };
-                let Some(info) = item.item().and_downcast::<gio::FileInfo>() else {
-                    return;
-                };
-                if let Some(label) = item.child().and_downcast::<gtk::Label>() {
-                    label.set_text(&f(&info));
-                }
-            });
-            factory
-        };
-
-        let size_text = |info: &gio::FileInfo| {
-            // Folders, and entries like an SMB share list's, have no size.
-            if is_dir(info) || !info.has_attribute("standard::size") {
-                String::new()
-            } else {
-                glib::format_size(ops::size_of(info)).to_string()
-            }
-        };
-
-        // Per-column sorters; the view's sorter is chained after folders-first.
-        // Keyed sorters: GTK works out each file's key once per sort.
-        let name_sorter = gtk::StringSorter::new(Some(info_key(|i| i.display_name().to_string())));
-        name_sorter.set_collation(gtk::Collation::Filename);
-        let size_sorter = gtk::NumericSorter::new(Some(info_key(ops::size_of)));
-        let time_sorter = gtk::NumericSorter::new(Some(info_key(|i| {
-            i.modification_date_time().map_or(0, |d| d.to_unix())
-        })));
-
-        let name_col = gtk::ColumnViewColumn::new(Some("Name"), Some(name_factory));
-        name_col.set_expand(true);
-        name_col.set_resizable(true);
-        name_col.set_sorter(Some(&name_sorter));
-        let size_col = gtk::ColumnViewColumn::new(
-            Some("Size"),
-            Some(text_factory(Rc::downgrade(win), size_text)),
-        );
-        size_col.set_fixed_width(100);
-        size_col.set_sorter(Some(&size_sorter));
-        let time_col = gtk::ColumnViewColumn::new(
-            Some("Modified"),
-            Some(text_factory(Rc::downgrade(win), format_time)),
-        );
-        time_col.set_fixed_width(130);
-        time_col.set_sorter(Some(&time_sorter));
-        win.view.append_column(&name_col);
-        win.view.append_column(&size_col);
-        win.view.append_column(&time_col);
-
-        // The headers pick the column; `apply_sort` builds the model's sorter.
-        if let Some(picked) = win.view.sorter() {
-            let w = Rc::downgrade(win);
-            picked.connect_changed(move |_, _| {
-                if let Some(win) = w.upgrade() {
-                    win.apply_sort();
-                }
-            });
-        }
-        win.view
-            .sort_by_column(Some(&name_col), gtk::SortType::Ascending);
-        win.apply_sort();
-
-        let w = Rc::downgrade(win);
-        win.view.connect_activate(move |_, pos| {
-            if let Some(win) = w.upgrade() {
-                win.activate(pos);
-            }
-        });
-
-        let w = Rc::downgrade(win);
-        win.selection.connect_selection_changed(move |_, _, _| {
-            if let Some(win) = w.upgrade() {
-                win.schedule_status();
-            }
-        });
-        let w = Rc::downgrade(win);
-        win.sorted.connect_items_changed(move |_, _, _, _| {
-            if let Some(win) = w.upgrade() {
-                win.schedule_status();
-                win.keep_top();
-            }
-        });
-    }
-
-    /// Sorts the model by group, folders first, then the column picked in
-    /// the header. The column view's own sorter isn't put on the model: it
-    /// gives GTK no sort keys, so every comparison would redo the work.
-    fn apply_sort(&self) {
-        let picked = self.view.sorter().and_downcast::<gtk::ColumnViewSorter>();
-        let descending = picked
-            .as_ref()
-            .is_some_and(|p| p.primary_sort_order() == gtk::SortType::Descending);
-        let by = picked
-            .and_then(|p| p.primary_sort_column())
-            .and_then(|c| c.sorter());
-        let all = gtk::MultiSorter::new();
-        all.append(self.group_sorter.clone());
-        all.append(self.folders_first.clone());
-        if let Some(by) = by {
-            match by.downcast::<gtk::NumericSorter>() {
-                Ok(numeric) => {
-                    let keyed = gtk::NumericSorter::new(numeric.expression());
-                    keyed.set_sort_order(if descending {
-                        gtk::SortType::Descending
-                    } else {
-                        gtk::SortType::Ascending
-                    });
-                    all.append(keyed);
-                }
-                // Strings can't sort keyed in reverse; Z→A compares directly.
-                Err(by) if descending => {
-                    all.append(gtk::CustomSorter::new(move |a, b| by.compare(b, a)));
-                }
-                Err(by) => all.append(by),
-            }
-        }
-        self.sorted.set_sorter(Some(&all));
-    }
-
-    /// Updates the footer once the current burst of changes is over: a
-    /// folder loads in many batches, and each would walk the selection.
-    fn schedule_status(self: &Rc<Self>) {
-        if self.status_pending.replace(true) {
-            return;
-        }
-        let w = Rc::downgrade(self);
-        glib::idle_add_local_once(move || {
-            if let Some(win) = w.upgrade() {
-                win.status_pending.set(false);
-                win.update_status();
-            }
-        });
-    }
-
-    /// The position in the shared selection of a view's item: the grouped
-    /// grid's positions include headings and fillers.
-    fn shared_pos(&self, grouped: bool, pos: u32) -> Option<u32> {
-        if pos == gtk::INVALID_LIST_POSITION {
-            None
-        } else if grouped {
-            self.grouped_model.file_at(pos)
-        } else {
-            Some(pos)
-        }
-    }
-
-    /// Right-click on a row selects it (unless it already is) and shows the
-    /// file menu.
-    fn attach_item_menu(
-        w: &Weak<Self>,
-        item: &gtk::ListItem,
-        widget: &impl IsA<gtk::Widget>,
-        grouped: bool,
-    ) {
-        let click = gtk::GestureClick::new();
-        click.set_button(gdk::BUTTON_SECONDARY);
-        let w = w.clone();
-        let item = item.downgrade();
-        let widget_ref = widget.as_ref().downgrade();
-        click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(win), Some(item), Some(widget)) =
-                (w.upgrade(), item.upgrade(), widget_ref.upgrade())
-            else {
-                return;
-            };
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            let Some(pos) = win.shared_pos(grouped, item.position()) else {
-                return;
-            };
-            if !win.selection.is_selected(pos) {
-                win.selection.select_item(pos, true);
-            }
-            let (x, y) = translate(&widget, &win.views, x, y);
-            win.show_file_menu(x, y);
-        });
-        widget.add_controller(click);
-    }
-
-    /// Ctrl+scroll zooms the file list.
-    fn setup_scroll_zoom(win: &Rc<Self>) {
-        // Discrete: GTK adds up a touchpad's small movements into whole
-        // notches, so each notch is exactly one zoom level. A short pause
-        // after each step keeps a fast flick from skipping levels.
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-        );
-        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let w = Rc::downgrade(win);
-        let last = Cell::new(None::<std::time::Instant>);
-        scroll.connect_scroll(move |c, _, dy| {
-            let ctrl = c
-                .current_event_state()
-                .contains(gdk::ModifierType::CONTROL_MASK);
-            let Some(win) = w.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            if !ctrl || dy == 0.0 {
-                return glib::Propagation::Proceed;
-            }
-            let settled = last
-                .get()
-                .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(120));
-            if settled {
-                last.set(Some(std::time::Instant::now()));
-                win.zoom_by(if dy < 0.0 { 1 } else { -1 });
-            }
-            glib::Propagation::Stop
-        });
-        win.views.add_controller(scroll);
-    }
-
-    fn setup_background_menu(win: &Rc<Self>) {
-        let views: [gtk::Widget; 3] = [
-            win.view.clone().upcast(),
-            win.grid.clone().upcast(),
-            win.groups.clone().upcast(),
-        ];
-        for view in views {
-            let click = gtk::GestureClick::new();
-            click.set_button(gdk::BUTTON_SECONDARY);
-            let w = Rc::downgrade(win);
-            let v = view.downgrade();
-            click.connect_pressed(move |_, _, x, y| {
-                let (Some(win), Some(v)) = (w.upgrade(), v.upgrade()) else {
-                    return;
-                };
-                win.selection.unselect_all();
-                let (x, y) = translate(&v, &win.views, x, y);
-                win.show_folder_menu(x, y);
-            });
-            view.add_controller(click);
-        }
-    }
-
     // ------------------------------------------------------- drag & drop --
 
-    /// Rows drag their selection out, and folder rows take drops (and open
-    /// after hovering), as in nautilus-list-base.c `setup_cell_common()`.
-    fn attach_item_dnd(
-        w: &Weak<Self>,
-        item: &gtk::ListItem,
-        widget: &impl IsA<gtk::Widget>,
-        grouped: bool,
-    ) {
-        let source = gtk::DragSource::new();
-        source.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let ww = w.clone();
-        let it = item.downgrade();
-        source.connect_prepare(move |source, _, _| {
-            let (win, item) = (ww.upgrade()?, it.upgrade()?);
-            let pos = win.shared_pos(grouped, item.position())?;
-            win.drag_prepare(source, pos)
-        });
-        widget.add_controller(source);
-
-        let it = item.downgrade();
-        let folder = Rc::new(move || {
-            let info = it.upgrade()?.item().and_downcast::<gio::FileInfo>()?;
-            is_dir(&info)
-                .then(|| info_file(info.upcast_ref()))
-                .flatten()
-        });
-        Self::attach_drop(w, widget, folder, true);
-    }
-
-    fn drag_prepare(&self, source: &gtk::DragSource, pos: u32) -> Option<gdk::ContentProvider> {
-        if pos == gtk::INVALID_LIST_POSITION {
-            return None;
-        }
-        // Dragging an unselected row drags just that row.
-        if !self.selection.is_selected(pos) {
-            self.selection.select_item(pos, true);
-        }
-        let selected = self.selected();
-        if selected.is_empty() {
-            return None;
-        }
-        let mut actions = gdk::DragAction::COPY | gdk::DragAction::MOVE | gdk::DragAction::LINK;
-        if selected
-            .iter()
-            .any(|(i, _)| i.has_attribute("access::can-delete") && !i.boolean("access::can-delete"))
-        {
-            actions.remove(gdk::DragAction::MOVE);
-        }
-        source.set_actions(actions);
-        {
-            let icon = crate::info::icon(&selected[0].0);
-            let theme = gtk::IconTheme::for_display(&WidgetExt::display(&self.window));
-            let paintable = theme.lookup_by_gicon(
-                &icon,
-                32,
-                self.window.scale_factor(),
-                gtk::TextDirection::None,
-                gtk::IconLookupFlags::empty(),
-            );
-            source.set_icon(Some(&paintable), 0, 0);
-        }
-        let files: Vec<gio::File> = selected.into_iter().map(|(_, f)| f).collect();
-        Some(gdk::ContentProvider::for_value(
-            &gdk::FileList::from_array(&files).to_value(),
-        ))
-    }
-
-    /// A drop target onto whatever folder `folder()` names right now. With
-    /// `hover_open`, holding a drag over it for a moment opens it.
-    fn attach_drop(
+    /// A drop target onto whatever folder `folder()` names right now.
+    /// Holding a drag over it for a moment does what `hover` says.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn attach_drop(
         w: &Weak<Self>,
         widget: &impl IsA<gtk::Widget>,
         folder: Rc<dyn Fn() -> Option<gio::File>>,
-        hover_open: bool,
+        hover: HoverOpen,
     ) {
         let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::all());
         target.set_types(&dnd::drop_types());
@@ -1417,7 +1111,7 @@ impl Win {
         });
         widget.add_controller(target);
 
-        if !hover_open {
+        if matches!(hover, HoverOpen::No) {
             return;
         }
         let motion = gtk::DropControllerMotion::new();
@@ -1452,18 +1146,29 @@ impl Win {
             let w2 = Rc::downgrade(&win);
             let folder = folder.clone();
             let action = action.clone();
+            let hover = hover.clone();
             let id = glib::timeout_add_local_once(
                 std::time::Duration::from_millis(dnd::HOVER_TIMEOUT_MS),
                 move || {
                     let Some(win) = w2.upgrade() else { return };
                     win.hover_timer.replace(None);
+                    if let HoverOpen::Select(tab) = &hover {
+                        if let Some(tab) = tab.upgrade() {
+                            win.select_tab(&tab);
+                        }
+                        return;
+                    }
                     if action.get().is_empty() {
                         return;
                     }
-                    if let Some(dest) = folder() {
-                        let here = win.current.borrow().clone();
+                    let tab = match &hover {
+                        HoverOpen::Tab(tab) => tab.upgrade(),
+                        _ => win.tab(),
+                    };
+                    if let (Some(tab), Some(dest)) = (tab, folder()) {
+                        let here = tab.current.borrow().clone();
                         if !dest.equal(&here) {
-                            win.navigate(dest, true);
+                            tab.navigate(dest, true);
                         }
                     }
                 },
@@ -1497,6 +1202,9 @@ impl Win {
             }
             if dest.has_uri_scheme("trash") {
                 self.trash(files);
+            } else if crate::starred::is_view(&dest) {
+                // Dropped on Starred: star them, wherever they are.
+                self.set_starred(&files, true);
             } else if action == gdk::DragAction::LINK {
                 self.run_job(ops::link(files, dest));
             } else if action == gdk::DragAction::MOVE {
@@ -1518,19 +1226,15 @@ impl Win {
         };
         let win = self.clone();
         glib::spawn_future_local(async move {
-            if let Err(e) = ops::new_file_with_contents(&dest, &name, bytes).await {
-                win.show_message(&e.to_string());
+            match ops::new_file_with_contents(&dest, &name, bytes).await {
+                Ok(made) => win.record("Drop", undo::Change::Created(vec![made])),
+                Err(e) => win.show_error(&e.to_string()),
             }
         });
         true
     }
 
     fn setup_dnd(win: &Rc<Self>) {
-        // Background of the list: drop into the current folder.
-        let w = Rc::downgrade(win);
-        let current = Rc::new(move || w.upgrade().map(|win| win.current.borrow().clone()));
-        Self::attach_drop(&Rc::downgrade(win), &win.views, current, false);
-
         // Show the bookmark strip while files are dragged over the sidebar.
         let Some(side) = win.sidebar.parent() else {
             return;
@@ -1602,62 +1306,31 @@ impl Win {
 
     // ------------------------------------------------------------- filter --
 
+    /// The filter box filters the active tab (each tab keeps its own text).
     fn setup_filter(win: &Rc<Self>) {
-        let w = Rc::downgrade(win);
-        win.filter.set_filter_func(move |obj| {
-            let Some(win) = w.upgrade() else { return true };
-            let Some(info) = obj.downcast_ref::<gio::FileInfo>() else {
-                return false;
-            };
-            if !win.show_hidden.get() && is_hidden(info) {
-                return false;
-            }
-            let shown = {
-                let needle = win.needle.borrow();
-                needle.is_empty() || search::matches(&info.display_name(), &needle)
-            };
-            if shown && crate::info::needs_type(info) {
-                win.queue_typing(info);
-            }
-            shown
-        });
-
         win.search.set_key_capture_widget(Some(&win.window));
         let w = Rc::downgrade(win);
         win.search.connect_search_changed(move |search| {
-            if let Some(win) = w.upgrade() {
-                // A longer term only hides more, a shorter one only shows
-                // more: GTK then rechecks just the files that could change.
-                let needle = search::fold(&search.text());
-                let old = win.needle.replace(needle.clone());
-                if needle != old {
-                    win.filter.changed(if needle.contains(old.as_str()) {
-                        gtk::FilterChange::MoreStrict
-                    } else if old.contains(needle.as_str()) {
-                        gtk::FilterChange::LessStrict
-                    } else {
-                        gtk::FilterChange::Different
-                    });
-                    win.start_search();
-                }
-                // Typing goes to the filter while focus stays on the list, so
-                // make the first match the current, selected row: Enter then
-                // opens it, and F2 / Menu / Delete act on it.
-                if !search.text().is_empty() && win.selection.n_items() > 0 {
-                    win.selection.select_item(0, true);
-                    win.scroll_to_pos(0);
-                }
+            let Some(tab) = w.upgrade().and_then(|win| win.tab()) else {
+                return;
+            };
+            let text = search.text().to_string();
+            // Switching tabs puts their text back here: nothing changed.
+            if text == *tab.search_text.borrow() {
+                return;
             }
+            tab.set_search(&text);
         });
         let w = Rc::downgrade(win);
         win.search.connect_activate(move |_| {
-            if let Some(win) = w.upgrade() {
-                if win.selection.n_items() > 0 {
-                    win.selection.select_item(0, true);
-                    win.scroll_to_pos(0);
+            let Some(win) = w.upgrade() else { return };
+            if let Some(tab) = win.tab() {
+                if tab.selection.n_items() > 0 {
+                    tab.selection.select_item(0, true);
+                    tab.scroll_to_pos(0);
                 }
-                win.focus_view();
             }
+            win.focus_view();
         });
         let w = Rc::downgrade(win);
         win.search.connect_stop_search(move |s| {
@@ -1668,209 +1341,55 @@ impl Win {
         });
     }
 
+    /// Shows or hides hidden files, in every tab.
     fn set_show_hidden(self: &Rc<Self>, show: bool) {
         self.show_hidden.set(show);
-        self.filter.changed(if show {
-            gtk::FilterChange::LessStrict
-        } else {
-            gtk::FilterChange::MoreStrict
-        });
-        // Hidden folders are skipped while searching, so search again.
-        if self.search_state.get() != SearchState::Off {
-            self.start_search();
+        // Remembered, as in Preferences.
+        let prefs = crate::prefs::get();
+        if prefs.show_hidden != show {
+            let _ = crate::prefs::set(crate::prefs::Prefs {
+                show_hidden: show,
+                ..prefs
+            });
+        }
+        for tab in self.all_tabs() {
+            tab.hidden_changed(show);
         }
     }
 
     // -------------------------------------------------------------- types --
 
-    /// Queues a shown file whose name didn't settle its type for a look at
-    /// its contents (see `info::needs_type`).
-    fn queue_typing(self: &Rc<Self>, info: &gio::FileInfo) {
-        self.untyped.borrow_mut().push(info.clone());
-        if self.typing.replace(true) {
-            return;
-        }
-        // Not from inside the filter: the models are mid-update.
-        let w = Rc::downgrade(self);
-        glib::idle_add_local_once(move || {
-            if let Some(win) = w.upgrade() {
-                win.type_queued();
-            }
-        });
-    }
-
-    /// Looks up the full types of queued files, a few at a time, and
-    /// refreshes the rows whose type turned out to be something.
-    fn type_queued(self: &Rc<Self>) {
-        use futures_util::StreamExt;
-        let w = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            loop {
-                let Some(batch) = w.upgrade().map(|win| win.untyped.take()) else {
-                    return;
-                };
-                if batch.is_empty() {
-                    break;
-                }
-                let typed: Vec<gio::FileInfo> = futures_util::stream::iter(batch)
-                    .map(|info| async move {
-                        let file = info_file(info.upcast_ref())?;
-                        let found = file
-                            .query_info_future(
-                                "standard::content-type",
-                                gio::FileQueryInfoFlags::NONE,
-                                glib::Priority::LOW,
-                            )
-                            .await
-                            .ok()?;
-                        let ct = found.content_type()?;
-                        (ct != "application/octet-stream").then(|| {
-                            crate::info::set_full_type(&info, &ct);
-                            info
-                        })
-                    })
-                    .buffer_unordered(crate::par::in_flight())
-                    .filter_map(std::future::ready)
-                    .collect()
-                    .await;
-                let Some(win) = w.upgrade() else { return };
-                win.refresh_rows(&typed);
-            }
-            if let Some(win) = w.upgrade() {
-                win.typing.set(false);
-                // Queued while the last batch was being looked up.
-                if !win.untyped.borrow().is_empty() && !win.typing.replace(true) {
-                    win.type_queued();
-                }
-            }
-        });
-    }
-
-    /// Re-shows the icon and thumbnail of `infos`' rows, whose type changed
-    /// (GTK won't refill a row whose item is the same object), and regroups.
-    fn refresh_rows(&self, infos: &[gio::FileInfo]) {
-        if infos.is_empty() {
-            return;
-        }
-        let by_uri: HashMap<String, &gio::FileInfo> = infos
-            .iter()
-            .filter_map(|i| Some((info_file(i.upcast_ref())?.uri().to_string(), i)))
-            .collect();
-        for image in shown_icons() {
-            if let Some(info) = by_uri.get(image.widget_name().as_str()) {
-                image.set_from_gicon(&crate::info::icon(info));
-                let picture = image.next_sibling().and_downcast::<gtk::Picture>();
-                show_thumbnail(&image, picture.as_ref(), info);
-            }
-        }
-        if self.grouped.get() {
-            self.group_sorter.changed(gtk::SorterChange::Different);
-        }
-    }
-
     // ------------------------------------------------------------- search --
-
-    /// Searches the subfolders for the current term (after the folder's own
-    /// files were filtered instantly), or goes back to the folder listing
-    /// when the term is too short or the folder can't be searched.
-    fn start_search(self: &Rc<Self>) {
-        use futures_util::StreamExt;
-        self.stop_search();
-        let needle = self.needle.borrow().clone();
-        let dir = self.current.borrow().clone();
-        if needle.chars().count() < SEARCH_MIN_CHARS || !search::can_search(&dir) {
-            return;
-        }
-        self.search_state.set(SearchState::Running);
-        self.schedule_status();
-        let hidden = self.show_hidden.get();
-        let w = Rc::downgrade(self);
-        let handle = glib::spawn_future_local(async move {
-            let store = gio::ListStore::new::<gio::FileInfo>();
-            let (tx, rx) = futures_channel::mpsc::unbounded::<Vec<PathBuf>>();
-            let find = search::run(&dir, &needle, hidden, move |batch| {
-                let _ = tx.unbounded_send(batch);
-            });
-            let seen = RefCell::new(HashSet::new());
-            let show = rx.for_each(|batch| {
-                let fresh: Vec<PathBuf> = batch
-                    .into_iter()
-                    .filter(|p| seen.borrow_mut().insert(p.clone()))
-                    .collect();
-                let (w, store, dir) = (w.clone(), store.clone(), dir.clone());
-                async move {
-                    let infos = hit_infos(&dir, fresh).await;
-                    let Some(win) = w.upgrade() else { return };
-                    store.extend_from_slice(&infos);
-                    // Swap the folder's listing for the results once some
-                    // are in, so typing never flashes an empty list.
-                    if store.n_items() > 0 && !win.showing(&store) {
-                        win.filtered.set_model(Some(&store));
-                    }
-                }
-            });
-            futures_util::future::join(find, show).await;
-            if let Some(win) = w.upgrade() {
-                if !win.showing(&store) {
-                    win.filtered.set_model(Some(&store));
-                }
-                win.search_state.set(SearchState::Done);
-                win.search_task.replace(None);
-                win.schedule_status();
-            }
-        });
-        self.search_task.replace(Some(handle));
-    }
-
-    fn showing(&self, model: &impl IsA<gio::ListModel>) -> bool {
-        self.filtered
-            .model()
-            .is_some_and(|m| &m == model.upcast_ref::<gio::ListModel>())
-    }
-
-    /// Stops a recursive search and shows the folder's own listing again.
-    fn stop_search(self: &Rc<Self>) {
-        if let Some(task) = self.search_task.take() {
-            task.abort();
-        }
-        if self.search_state.replace(SearchState::Off) != SearchState::Off {
-            let list = self.list.borrow().clone();
-            if !self.showing(&list) {
-                self.filtered.set_model(Some(&list));
-            }
-            self.schedule_status();
-        }
-    }
 
     // --------------------------------------------------------- navigation --
 
     fn setup_navigation(win: &Rc<Self>) {
         let w = Rc::downgrade(win);
         win.back_btn.connect_clicked(move |_| {
-            if let Some(win) = w.upgrade() {
-                win.go_back();
+            if let Some(tab) = w.upgrade().and_then(|win| win.tab()) {
+                tab.go_back();
             }
         });
         let w = Rc::downgrade(win);
         win.forward_btn.connect_clicked(move |_| {
-            if let Some(win) = w.upgrade() {
-                win.go_forward();
+            if let Some(tab) = w.upgrade().and_then(|win| win.tab()) {
+                tab.go_forward();
             }
         });
         let w = Rc::downgrade(win);
         win.up_btn.connect_clicked(move |_| {
-            if let Some(win) = w.upgrade() {
-                win.go_up();
+            if let Some(tab) = w.upgrade().and_then(|win| win.tab()) {
+                tab.go_up();
             }
         });
 
         let w = Rc::downgrade(win);
         win.location.connect_activate(move |entry| {
-            if let Some(win) = w.upgrade() {
-                let file = win.parse_location(&entry.text());
-                win.hide_location();
-                win.navigate(file, true);
-            }
+            let Some(win) = w.upgrade() else { return };
+            let Some(tab) = win.tab() else { return };
+            let file = tab.parse_location(&entry.text());
+            win.hide_location();
+            tab.navigate(file, true);
         });
         let keys = gtk::EventControllerKey::new();
         let w = Rc::downgrade(win);
@@ -1885,9 +1404,6 @@ impl Win {
         });
         win.location.add_controller(keys);
 
-        let first = win.list.borrow().clone();
-        win.watch_list(&first);
-
         // Refresh Tailscale peers when the window comes back into focus.
         let w = Rc::downgrade(win);
         win.window.connect_is_active_notify(move |window| {
@@ -1897,196 +1413,26 @@ impl Win {
         });
     }
 
-    fn parse_location(&self, text: &str) -> gio::File {
-        let text = text.trim();
-        if let Some(rest) = text.strip_prefix('~') {
-            return gio::File::for_path(format!("{}{}", glib::home_dir().display(), rest));
+    /// Opens `file` in the active tab.
+    pub(super) fn navigate(&self, file: gio::File) {
+        if let Some(tab) = self.tab() {
+            tab.navigate(file, true);
         }
-        if text.starts_with('/') || text.contains("://") || text.ends_with(":///") {
-            return gio::File::for_commandline_arg(text);
-        }
-        self.current.borrow().resolve_relative_path(text)
-    }
-
-    pub fn navigate(self: &Rc<Self>, file: gio::File, record: bool) {
-        if record {
-            let current = self.current.borrow().clone();
-            if !current.equal(&file) {
-                self.back.borrow_mut().push(current);
-                self.forward.borrow_mut().clear();
-            }
-        }
-        // Set before reloading: the path bar and sidebar read `current`.
-        *self.current.borrow_mut() = file;
-        self.search.set_text("");
-        self.selection.unselect_all();
-        let file = self.current.borrow().clone();
-        self.reload_at(&file, false);
-    }
-
-    /// Reports a listing's errors and progress while it's the one shown.
-    fn watch_list(self: &Rc<Self>, list: &gtk::DirectoryList) {
-        // Mount on demand (nautilus-window-slot.c: mount_not_mounted_cb).
-        let w = Rc::downgrade(self);
-        list.connect_error_notify(move |list| {
-            let Some(win) = w.upgrade().filter(|win| *win.list.borrow() == *list) else {
-                return;
-            };
-            let Some(error) = list.error() else {
-                return;
-            };
-            if error.matches(gio::IOErrorEnum::NotMounted) {
-                let file = win.current.borrow().clone();
-                win.mount_then(file, |win, file| win.reload_at(&file, true));
-            } else {
-                win.show_message(&error.to_string());
-            }
-        });
-        let w = Rc::downgrade(self);
-        list.connect_loading_notify(move |list| {
-            let Some(win) = w.upgrade().filter(|win| *win.list.borrow() == *list) else {
-                return;
-            };
-            win.schedule_status();
-            if !list.is_loading() {
-                win.reveal_top();
-            }
-        });
-    }
-
-    /// Shows `file`'s listing: the one kept from a recent visit when it's
-    /// still good (and `fresh` isn't asked for), otherwise read anew. The
-    /// listing being left is kept for later.
-    fn show_listing(self: &Rc<Self>, file: &gio::File, fresh: bool) {
-        self.stop_search();
-        let current = self.list.borrow().clone();
-        let reread = |list: &gtk::DirectoryList| {
-            list.set_file(None::<&gio::File>);
-            list.set_attributes(Some(crate::info::attributes(file)));
-            list.set_file(Some(file));
-        };
-        // The same folder (Reload), or the very first listing.
-        if current.file().is_none_or(|f| f.equal(file)) {
-            reread(&current);
-            return;
-        }
-        let kept = {
-            let mut recent = self.recent.borrow_mut();
-            recent
-                .iter()
-                .position(|l| l.file().is_some_and(|f| f.equal(file)))
-                .and_then(|i| recent.remove(i))
-        };
-        let next = match kept {
-            // Local folders only (one stat), so a deleted one isn't shown stale.
-            Some(list)
-                if !fresh
-                    && list.error().is_none()
-                    && keeps_fresh(file)
-                    && file.query_exists(gio::Cancellable::NONE) =>
-            {
-                list
-            }
-            Some(list) => {
-                reread(&list);
-                list
-            }
-            None => {
-                let list = new_list();
-                self.watch_list(&list);
-                list.set_attributes(Some(crate::info::attributes(file)));
-                list.set_file(Some(file));
-                list
-            }
-        };
-        self.list.replace(next.clone());
-        self.filtered.set_model(Some(&next));
-        // A kept listing would otherwise open where it was scrolled.
-        if next.n_items() > 0 {
-            self.view
-                .scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
-            self.grid.scroll_to(0, gtk::ListScrollFlags::NONE, None);
-        }
-        if current.file().is_some_and(|f| keeps_fresh(&f)) && current.error().is_none() {
-            let mut recent = self.recent.borrow_mut();
-            recent.push_front(current);
-            let mut files = 0;
-            let mut keep = 0;
-            for list in recent.iter() {
-                files += list.n_items();
-                if keep == RECENT_FOLDERS || (keep > 0 && files > RECENT_FILES) {
-                    break;
-                }
-                keep += 1;
-            }
-            recent.truncate(keep);
-        }
-    }
-
-    fn reload_at(self: &Rc<Self>, file: &gio::File, fresh: bool) {
-        self.show_listing(file, fresh);
-        self.rebuild_pathbar();
-        self.back_btn.set_sensitive(!self.back.borrow().is_empty());
-        self.forward_btn
-            .set_sensitive(!self.forward.borrow().is_empty());
-        self.up_btn.set_sensitive(parent_of(file).is_some());
-        let name = if file.parent().is_none() {
-            root_label(file)
-        } else {
-            ops::display_name(file)
-        };
-        self.window.set_title(Some(&format!("{name} — Abyss")));
-        self.select_sidebar_row();
-        self.schedule_status();
     }
 
     fn reload(self: &Rc<Self>) {
-        let file = self.current.borrow().clone();
-        self.reload_at(&file, true);
-    }
-
-    fn go_back(self: &Rc<Self>) {
-        let Some(prev) = self.back.borrow_mut().pop() else {
-            return;
-        };
-        let current = self.current.borrow().clone();
-        self.forward.borrow_mut().push(current);
-        self.navigate(prev, false);
-    }
-
-    fn go_forward(self: &Rc<Self>) {
-        let Some(next) = self.forward.borrow_mut().pop() else {
-            return;
-        };
-        let current = self.current.borrow().clone();
-        self.back.borrow_mut().push(current);
-        self.navigate(next, false);
-    }
-
-    fn go_up(self: &Rc<Self>) {
-        let parent = parent_of(&self.current.borrow());
-        if let Some(parent) = parent {
-            self.navigate(parent, true);
+        if let Some(tab) = self.tab() {
+            tab.reload();
         }
     }
 
     fn show_location(&self) {
-        let file = self.current.borrow().clone();
-        let text = match file.path() {
-            Some(p) if file.is_native() => p.display().to_string(),
-            _ => file.uri().to_string(),
-        };
+        let Some(tab) = self.tab() else { return };
+        let text = tab::location_text(&tab.current.borrow());
         self.location.set_text(&text);
         self.path_stack.set_visible_child_name("entry");
         self.location.grab_focus();
         self.location.select_region(0, -1);
-    }
-
-    fn prompt_location(&self, prefix: &str) {
-        self.path_stack.set_visible_child_name("entry");
-        self.location.set_text(prefix);
-        self.location.grab_focus();
-        self.location.set_position(-1);
     }
 
     fn hide_location(&self) {
@@ -2094,14 +1440,15 @@ impl Win {
         self.focus_view();
     }
 
-    /// Breadcrumbs from the root (or ~) to the current folder.
+    /// Breadcrumbs from the root (or ~) to the active tab's folder.
     fn rebuild_pathbar(self: &Rc<Self>) {
         while let Some(child) = self.pathbar.first_child() {
             self.pathbar.remove(&child);
         }
+        let Some(tab) = self.tab() else { return };
         let home = gio::File::for_path(glib::home_dir());
         let mut chain = Vec::new();
-        let mut cursor = Some(self.current.borrow().clone());
+        let mut cursor = Some(tab.current.borrow().clone());
         while let Some(f) = cursor {
             let at_home = f.equal(&home);
             cursor = if at_home { None } else { parent_of(&f) };
@@ -2137,13 +1484,13 @@ impl Win {
                     &Rc::downgrade(self),
                     &button,
                     Rc::new(move || Some(f.clone())),
-                    true,
+                    HoverOpen::Active,
                 );
             }
             let w = Rc::downgrade(self);
             button.connect_clicked(move |_| {
                 if let Some(win) = w.upgrade() {
-                    win.navigate(file.clone(), true);
+                    win.navigate(file.clone());
                 }
             });
             self.pathbar.append(&button);
@@ -2173,131 +1520,20 @@ impl Win {
         }
     }
 
-    fn mount_then(
-        self: &Rc<Self>,
-        file: gio::File,
-        then: impl FnOnce(&Rc<Self>, gio::File) + 'static,
-    ) {
-        let op = self.auth.operation(Some(&file.uri()));
-        let win = self.clone();
-        self.show_message(&format!("Connecting to {}…", root_label(&file)));
-        glib::spawn_future_local(async move {
-            match file
-                .mount_enclosing_volume_future(gio::MountMountFlags::NONE, Some(&op))
-                .await
-            {
-                Ok(()) => {
-                    win.show_message("");
-                    then(&win, file);
-                }
-                Err(e) if e.matches(gio::IOErrorEnum::AlreadyMounted) => then(&win, file),
-                Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => win.show_message(""),
-                Err(e) => win.show_message(&e.to_string()),
-            }
-        });
-    }
-
     // ------------------------------------------------------------ opening --
-
-    fn item(&self, pos: u32) -> Option<gio::FileInfo> {
-        self.selection.item(pos).and_downcast::<gio::FileInfo>()
-    }
-
-    fn selected(&self) -> Vec<(gio::FileInfo, gio::File)> {
-        let set = self.selection.selection();
-        let mut out = Vec::new();
-        if let Some((iter, first)) = gtk::BitsetIter::init_first(&set) {
-            for pos in std::iter::once(first).chain(iter) {
-                if let Some(info) = self.item(pos) {
-                    if let Some(file) = info_file(info.upcast_ref()) {
-                        out.push((info, file));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn selected_files(&self) -> Vec<gio::File> {
-        self.selected().into_iter().map(|(_, f)| f).collect()
-    }
-
-    fn activate(self: &Rc<Self>, pos: u32) {
-        let targets = if self.selection.is_selected(pos) {
-            self.selected()
-        } else {
-            self.item(pos)
-                .and_then(|i| info_file(i.upcast_ref()).map(|f| (i, f)))
-                .into_iter()
-                .collect()
-        };
-        // A single folder navigates; files open with their default apps.
-        if let [(info, file)] = targets.as_slice() {
-            if self.open_location(info, file) {
-                return;
-            }
-        }
-        for (info, file) in targets {
-            if !is_dir(&info) {
-                self.launch(&file, None);
-            }
-        }
-    }
-
-    /// Handles folders, network mountables and shortcuts; false for files.
-    fn open_location(self: &Rc<Self>, info: &gio::FileInfo, file: &gio::File) -> bool {
-        match info.file_type() {
-            gio::FileType::Directory => {
-                self.navigate(file.clone(), true);
-                true
-            }
-            gio::FileType::Mountable => {
-                // Share the login with the server the mountable points at.
-                let target = info
-                    .attribute_string("standard::target-uri")
-                    .map_or_else(|| file.uri().to_string(), |t| t.to_string());
-                let op = self.auth.operation(Some(&target));
-                let win = self.clone();
-                let file = file.clone();
-                glib::spawn_future_local(async move {
-                    match file
-                        .mount_mountable_future(gio::MountMountFlags::NONE, Some(&op))
-                        .await
-                    {
-                        Ok(target) => win.navigate(target, true),
-                        Err(e) if e.matches(gio::IOErrorEnum::AlreadyMounted) => {
-                            if let Some(uri) = info_target(&file).await {
-                                win.navigate(gio::File::for_uri(&uri), true);
-                            }
-                        }
-                        Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => {}
-                        Err(e) => win.show_message(&e.to_string()),
-                    }
-                });
-                true
-            }
-            gio::FileType::Shortcut => {
-                if let Some(uri) = info.attribute_string("standard::target-uri") {
-                    self.navigate(gio::File::for_uri(&uri), true);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
 
     /// Opens several files with one app (GIO starts one instance per file
     /// if the app can't take them all).
     fn launch_files(&self, files: &[gio::File], app: &gio::AppInfo) {
         let ctx = WidgetExt::display(&self.window).app_launch_context();
         if let Err(e) = app.launch(files, Some(&ctx)) {
-            self.show_message(&e.to_string());
+            self.show_error(&e.to_string());
         }
     }
 
     /// The app chooser for the selection (`action_open_with_other_application`).
     fn open_with_other(self: &Rc<Self>) {
-        let selected = self.selected();
+        let selected = self.tab().map(|t| t.selected()).unwrap_or_default();
         let Some((first, _)) = selected.first() else {
             return;
         };
@@ -2337,7 +1573,7 @@ impl Win {
         chooser::show(self.window.upcast_ref(), content_type, subject, on_chosen);
     }
 
-    fn launch(self: &Rc<Self>, file: &gio::File, app: Option<gio::AppInfo>) {
+    pub(super) fn launch(self: &Rc<Self>, file: &gio::File, app: Option<gio::AppInfo>) {
         let ctx = WidgetExt::display(&self.window).app_launch_context();
         let uri = file.uri().to_string();
         let win = self.clone();
@@ -2347,23 +1583,27 @@ impl Win {
                 None => gio::AppInfo::launch_default_for_uri_future(&uri, Some(&ctx)).await,
             };
             if let Err(e) = result {
-                win.show_message(&e.to_string());
+                win.show_error(&e.to_string());
             }
         });
     }
 
     fn open_terminal(&self, dir: &gio::File) {
         let (Some(term), Some(path)) = (terminal(), dir.path()) else {
-            self.show_message("No terminal found (set $TERMINAL)");
+            self.show_error("No terminal found (set $TERMINAL)");
             return;
         };
-        let mut cmd = std::process::Command::new(&term);
+        // A command from Preferences may carry its own arguments.
+        let mut words = term.split_whitespace();
+        let program = words.next().unwrap_or_default().to_owned();
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(words);
         cmd.current_dir(&path);
-        if term == "alacritty" || term == "wezterm" {
+        if program == "alacritty" || program == "wezterm" {
             cmd.arg("--working-directory").arg(&path);
         }
         if let Err(e) = cmd.spawn() {
-            self.show_message(&e.to_string());
+            self.show_error(&e.to_string());
         }
     }
 
@@ -2401,7 +1641,8 @@ impl Win {
             }
         }
         popover.set_child(Some(&column));
-        popover.set_parent(&self.views);
+        let Some(tab) = self.tab() else { return };
+        popover.set_parent(&tab.views);
         popover.set_pointing_to(Some(&spot(x, y)));
         popover.connect_closed(|p| {
             let p = p.clone();
@@ -2448,6 +1689,17 @@ impl Win {
             }
             return items;
         }
+        // Folders open here, in a new tab, or in the other pane.
+        let f = file.clone();
+        items.push(self.menu_action("Open in New Tab", move |win| {
+            if let Some(tab) = win.tab() {
+                win.open_tab_beside(&tab, f.clone(), true);
+            }
+        }));
+        let f = file.clone();
+        items.push(self.menu_action("Open in Other Pane", move |win| {
+            win.open_in_other_pane(f.clone());
+        }));
         if !file.is_native() {
             return items;
         }
@@ -2471,17 +1723,23 @@ impl Win {
         items
     }
 
-    fn show_file_menu(self: &Rc<Self>, x: f64, y: f64) {
-        let selected = self.selected();
+    // Every entry the file menu can have, in order; split up, the order
+    // would be hard to follow.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn show_file_menu(self: &Rc<Self>, x: f64, y: f64) {
+        let Some(tab) = self.tab() else { return };
+        let selected = tab.selected();
         if selected.is_empty() {
             return;
         }
         let files: Vec<gio::File> = selected.iter().map(|(_, f)| f.clone()).collect();
-        let in_trash = self.current.borrow().uri_scheme().as_deref() == Some("trash");
+        let in_trash = tab.current.borrow().uri_scheme().as_deref() == Some("trash");
 
         let mut items = vec![self.menu_action("Open", |win: &Rc<Self>| {
-            if let Some(pos) = first_selected(&win.selection) {
-                win.activate(pos);
+            if let Some(tab) = win.tab() {
+                if let Some(pos) = first_selected(&tab.selection) {
+                    tab.activate(pos);
+                }
             }
         })];
 
@@ -2501,11 +1759,18 @@ impl Win {
         {
             let f = files.clone();
             items.push(self.menu_action("Extract Here", move |win| {
-                let dest = win.current.borrow().clone();
-                win.extract(f.clone(), dest);
+                if let Some(tab) = win.tab() {
+                    let dest = tab.current.borrow().clone();
+                    win.extract(f.clone(), dest);
+                }
             }));
             let f = files.clone();
             items.push(self.menu_action("Extract To…", move |win| win.extract_to(f.clone())));
+        }
+        // Compress: local (or mounted) items, with bsdtar.
+        if !in_trash && archive::have_bsdtar() && files.iter().all(|f| f.path().is_some()) {
+            let f = files.clone();
+            items.push(self.menu_action("Compress…", move |win| win.start_compress(f.clone())));
         }
         items.push(MenuItem::Separator);
 
@@ -2532,12 +1797,37 @@ impl Win {
         items.push(self.menu_action("Copy", |win: &Rc<Self>| win.copy_selection(false)));
         let f = files.clone();
         items.push(self.menu_action("Duplicate", move |win: &Rc<Self>| {
-            let dest = win.current.borrow().clone();
-            win.run_transfer(f.clone(), dest, Kind::Copy);
+            if let Some(tab) = win.tab() {
+                let dest = tab.current.borrow().clone();
+                win.run_transfer(f.clone(), dest, Kind::Copy);
+            }
         }));
-        if selected.len() == 1 {
-            items.push(self.menu_action("Rename…", |win: &Rc<Self>| win.start_rename()));
+        if self.split.get() {
+            items.push(
+                self.menu_action("Copy to Other Pane (F5)", |win: &Rc<Self>| {
+                    win.to_other_pane(Kind::Copy);
+                }),
+            );
+            items.push(
+                self.menu_action("Move to Other Pane (F6)", |win: &Rc<Self>| {
+                    win.to_other_pane(Kind::Move);
+                }),
+            );
         }
+        items.push(self.menu_action(
+            if selected.len() == 1 {
+                "Rename…"
+            } else {
+                "Rename Several…"
+            },
+            |win: &Rc<Self>| win.start_rename(),
+        ));
+        let all_starred = files.iter().all(crate::starred::is_starred);
+        let f = files.clone();
+        items.push(self.menu_action(
+            if all_starred { "Unstar" } else { "Star" },
+            move |win: &Rc<Self>| win.set_starred(&f, !all_starred),
+        ));
         items.push(self.menu_action("Copy Path", |win: &Rc<Self>| win.copy_paths()));
         items.push(MenuItem::Separator);
         let f = files.clone();
@@ -2546,12 +1836,19 @@ impl Win {
         items.push(self.menu_action("Delete Forever…", move |win: &Rc<Self>| {
             win.confirm_delete(f.clone());
         }));
+        items.push(MenuItem::Separator);
+        items.push(self.menu_action("Properties", Self::show_properties));
         self.popover_at(x, y, items);
     }
 
-    fn show_folder_menu(self: &Rc<Self>, x: f64, y: f64) {
-        let dir = self.current.borrow().clone();
+    pub(super) fn show_folder_menu(self: &Rc<Self>, x: f64, y: f64) {
+        let Some(tab) = self.tab() else { return };
+        let dir = tab.current.borrow().clone();
         let mut items = Vec::new();
+        if let Some(label) = self.last_step() {
+            items.push(self.menu_action(&format!("Undo {label}"), Self::undo));
+            items.push(MenuItem::Separator);
+        }
         if dir.uri_scheme().as_deref() == Some("trash") {
             items.push(self.menu_action("Restore All", Self::restore_all));
             items.push(self.menu_action("Empty Trash…", Self::confirm_empty_trash));
@@ -2571,13 +1868,20 @@ impl Win {
         };
         items.push(self.menu_action(label, |win| win.set_show_hidden(!win.show_hidden.get())));
         items.push(self.menu_action("Reload", Self::reload));
+        items.push(self.menu_action("Properties", |win| {
+            // Of the folder itself: nothing selected.
+            if let Some(tab) = win.tab() {
+                tab.selection.unselect_all();
+            }
+            win.show_properties();
+        }));
         self.popover_at(x, y, items);
     }
 
     // ---------------------------------------------------------- clipboard --
 
     fn copy_selection(&self, cut: bool) {
-        let files = self.selected_files();
+        let files = self.tab().map(|t| t.selected_files()).unwrap_or_default();
         if files.is_empty() {
             return;
         }
@@ -2597,7 +1901,7 @@ impl Win {
         ];
         let provider = gdk::ContentProvider::new_union(&providers);
         if let Err(e) = self.window.clipboard().set_content(Some(&provider)) {
-            self.show_message(&e.to_string());
+            self.show_error(&e.to_string());
             return;
         }
         let n = files.len();
@@ -2611,7 +1915,9 @@ impl Win {
 
     fn copy_paths(&self) {
         let text: Vec<String> = self
-            .selected_files()
+            .tab()
+            .map(|t| t.selected_files())
+            .unwrap_or_default()
             .iter()
             .map(|f| {
                 f.path()
@@ -2622,7 +1928,8 @@ impl Win {
     }
 
     fn paste(self: &Rc<Self>) {
-        let dest = self.current.borrow().clone();
+        let Some(tab) = self.tab() else { return };
+        let dest = tab.current.borrow().clone();
         let clipboard = self.window.clipboard();
         if clipboard.is_local() {
             let clip = self.clip.borrow().clone();
@@ -2683,7 +1990,12 @@ impl Win {
 
     // ----------------------------------------------------------- file ops --
 
-    fn run_transfer(self: &Rc<Self>, files: Vec<gio::File>, dest: gio::File, kind: Kind) {
+    pub(super) fn run_transfer(
+        self: &Rc<Self>,
+        files: Vec<gio::File>,
+        dest: gio::File,
+        kind: Kind,
+    ) {
         if files.is_empty() {
             return;
         }
@@ -2717,11 +2029,31 @@ impl Win {
                 rx.await.unwrap_or((ops::Choice::Cancel, false))
             })
         });
+        let w = Rc::downgrade(self);
         self.run_job(async move {
-            ops::transfer(files, dest, kind, report, resolve)
-                .await
-                .map(|_| ())
+            let (result, placed) = ops::transfer_logged(files, dest, kind, report, resolve).await;
+            if let Some(win) = w.upgrade() {
+                win.record_transfer(kind, placed);
+            }
+            result.map(|_| ())
         });
+    }
+
+    /// Notes what a copy or move placed, for undo. Replaced files had their
+    /// content overwritten: those can't come back, so the label says so.
+    fn record_transfer(&self, kind: Kind, placed: ops::Placed) {
+        let what = if kind == Kind::Move { "Move" } else { "Copy" };
+        let label = if placed.replaced > 0 {
+            format!("{what} (replaced files stay replaced)")
+        } else {
+            what.to_owned()
+        };
+        let change = if kind == Kind::Move {
+            undo::Change::Moved(placed.fresh)
+        } else {
+            undo::Change::Created(placed.fresh.into_iter().map(|(_, made)| made).collect())
+        };
+        self.record(&label, change);
     }
 
     /// Runs one job at a time with the job bar shown.
@@ -2730,7 +2062,7 @@ impl Win {
         job: impl std::future::Future<Output = Result<(), glib::Error>> + 'static,
     ) {
         if self.busy.get() {
-            self.show_message("Another operation is still running");
+            self.show_error("Another operation is still running");
             return;
         }
         self.busy.set(true);
@@ -2746,7 +2078,7 @@ impl Win {
             win.finish_job();
             match result {
                 Err(e) if e.matches(gio::IOErrorEnum::Cancelled) => win.show_message("Cancelled"),
-                Err(e) => win.show_message(&e.to_string()),
+                Err(e) => win.show_error(&e.to_string()),
                 Ok(()) => {}
             }
         });
@@ -2768,6 +2100,10 @@ impl Win {
         self.busy.set(false);
         self.job.set_reveal_child(false);
         self.close_conflict();
+        // A job may have filled or freed space.
+        if let Some(tab) = self.tab() {
+            tab.refresh_free_space();
+        }
     }
 
     /// Stops the running job; dropping its future cancels the GIO call in
@@ -2865,7 +2201,7 @@ impl Win {
         }
         let name = self.conflict_entry.text().to_string();
         if let Err(e) = crate::filename::validate(&name) {
-            self.show_message(e);
+            self.show_error(e);
             return;
         }
         self.answer_conflict(ops::Choice::Rename(name));
@@ -2876,21 +2212,24 @@ impl Win {
         self.conflict.set_reveal_child(false);
     }
 
-    fn trash(self: &Rc<Self>, files: Vec<gio::File>) {
+    pub(super) fn trash(self: &Rc<Self>, files: Vec<gio::File>) {
         let win = self.clone();
         let n = files.len();
         glib::spawn_future_local(async move {
             match ops::trash(files.clone()).await {
-                Ok(()) => win.show_message(&format!(
-                    "Moved {n} item{} to the trash",
-                    if n == 1 { "" } else { "s" }
-                )),
+                Ok(()) => {
+                    win.show_message(&format!(
+                        "Moved {n} item{} to the trash",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                    win.record("Move to Trash", undo::Change::Trashed(files));
+                }
                 // Remote locations often have no trash (nautilus offers the same).
                 Err(e) if e.matches(gio::IOErrorEnum::NotSupported) => {
                     win.show_message("This location has no trash");
                     win.confirm_delete(files);
                 }
-                Err(e) => win.show_message(&e.to_string()),
+                Err(e) => win.show_error(&e.to_string()),
             }
         });
     }
@@ -2919,7 +2258,7 @@ impl Win {
                         glib::Priority::DEFAULT,
                     );
                     if let Err(e) = mv.await {
-                        win.show_message(&e.to_string());
+                        win.show_error(&e.to_string());
                         return;
                     }
                 }
@@ -2934,7 +2273,7 @@ impl Win {
             let trash = gio::File::for_uri("trash:///");
             let items = match ops::trash_items(&trash).await {
                 Ok(items) => items,
-                Err(e) => return win.show_message(&e.to_string()),
+                Err(e) => return win.show_error(&e.to_string()),
             };
             let n = items.len();
             win.restore(items);
@@ -2985,7 +2324,10 @@ impl Win {
                 let mut passphrase: Option<String> = None;
                 loop {
                     match archive::extract(&archive, &dest, passphrase.as_deref(), &report).await {
-                        Ok(_) => break,
+                        Ok(made) => {
+                            win.record("Extract", undo::Change::Created(vec![made]));
+                            break;
+                        }
                         Err(archive::Error::NeedsPassphrase) => {
                             let retry = passphrase.is_some();
                             passphrase = Some(
@@ -3005,19 +2347,127 @@ impl Win {
     /// "Extract To…": the destination is typed in the prompt bar (a path,
     /// `~/…` or a URI), prefilled with the current folder.
     fn extract_to(self: &Rc<Self>, archives: Vec<gio::File>) {
-        let here = self.current.borrow().clone();
+        let Some(tab) = self.tab() else { return };
+        let here = tab.current.borrow().clone();
         let text = here
             .path()
             .map_or_else(|| here.uri().to_string(), |p| p.display().to_string());
         let archives = RefCell::new(archives);
         self.ask("Extract to", Some(&text), "Extract", move |win, text| {
-            let dest = win.parse_location(&text);
+            let dest = tab.parse_location(&text);
             win.extract(archives.take(), dest);
         });
         self.prompt_entry.set_position(-1);
     }
 
-    fn confirm_delete(self: &Rc<Self>, files: Vec<gio::File>) {
+    /// Compress: the archive's name and format are asked in the prompt bar
+    /// (one item: its name; several: "Archive"); it goes beside them.
+    fn start_compress(self: &Rc<Self>, files: Vec<gio::File>) {
+        thread_local! {
+            /// The format picked last time, offered first next time.
+            static LAST: Cell<u32> = const { Cell::new(0) };
+        }
+        let Some(first) = files.first() else { return };
+        let Some(dest_dir) = first.parent() else {
+            return;
+        };
+        let name = if let [only] = files.as_slice() {
+            let name = ops::display_name(only);
+            // From the selection, so nothing is asked of a slow share here.
+            let is_dir = self
+                .tab()
+                .is_some_and(|t| t.selected().iter().any(|(i, f)| f.equal(only) && is_dir(i)));
+            if is_dir {
+                name
+            } else {
+                name[..crate::filename::extension_start(&name)].to_owned()
+            }
+        } else {
+            "Archive".to_owned()
+        };
+        let labels: Vec<String> = archive::FORMATS
+            .iter()
+            .map(|(label, ext)| format!("{label} ({ext})"))
+            .collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let format = gtk::DropDown::from_strings(&labels);
+        format.set_selected(LAST.get());
+        let picked = format.clone();
+        let files = RefCell::new(files);
+        self.ask("Compress as", Some(&name), "Compress", move |win, name| {
+            let index = picked.selected();
+            LAST.set(index);
+            let ext = archive::FORMATS
+                .get(usize::try_from(index).unwrap_or(0))
+                .map_or(".zip", |(_, ext)| ext);
+            let full = format!("{}{ext}", name.trim());
+            if let Err(e) = crate::filename::validate(&full) {
+                win.show_error(e);
+                return;
+            }
+            win.compress(files.take(), dest_dir.clone(), full);
+        });
+        self.prompt_extra.append(&format);
+        self.prompt_entry.select_region(0, -1);
+    }
+
+    /// Packs `files` into `name` in `dir` (a free name if it's taken).
+    fn compress(self: &Rc<Self>, files: Vec<gio::File>, dir: gio::File, name: String) {
+        let w = Rc::downgrade(self);
+        let report: ops::Report = Rc::new(move |p: &ops::Progress| {
+            if let Some(win) = w.upgrade() {
+                win.job_label.set_text(&format!(
+                    "Compressing {} of {} · {}",
+                    p.done_files.min(p.total_files),
+                    p.total_files,
+                    p.current
+                ));
+                win.show_progress(p);
+            }
+        });
+        let w = Rc::downgrade(self);
+        self.run_job(async move {
+            let dest = ops::free_target(&dir, &name, false, false).await;
+            match archive::compress(&files, &dest, &report).await {
+                Ok(made) => {
+                    if let Some(win) = w.upgrade() {
+                        win.show_message(&format!("Made “{}”", ops::display_name(&made)));
+                        win.record("Compress", undo::Change::Created(vec![made]));
+                    }
+                    Ok(())
+                }
+                Err(archive::Error::Failed(e)) => Err(e),
+                Err(archive::Error::NeedsPassphrase) => Err(ops::cancelled()),
+            }
+        });
+    }
+
+    /// Stars or unstars `files`, and shows Starred again where it's open.
+    fn set_starred(self: &Rc<Self>, files: &[gio::File], on: bool) {
+        let result = if on {
+            crate::starred::star(files)
+        } else {
+            crate::starred::unstar(files)
+        };
+        if let Err(e) = result {
+            self.show_error(&format!("Couldn't save the starred list: {e}"));
+            return;
+        }
+        let n = files.len();
+        let items = if n == 1 { "item" } else { "items" };
+        self.show_message(&if on {
+            format!("Starred {n} {items}")
+        } else {
+            format!("Unstarred {n} {items}")
+        });
+        for tab in self.all_tabs() {
+            if crate::starred::is_view(&tab.current.borrow()) {
+                tab.reload_at(&gio::File::for_uri(crate::starred::VIEW), true);
+            }
+        }
+    }
+
+    pub(super) fn confirm_delete(self: &Rc<Self>, files: Vec<gio::File>) {
         let n = files.len();
         let what = if n == 1 {
             format!("“{}”", ops::display_name(&files[0]))
@@ -3047,8 +2497,13 @@ impl Win {
         );
     }
 
-    fn start_rename(self: &Rc<Self>) {
-        let Ok::<[_; 1], _>([(info, file)]) = self.selected().try_into() else {
+    pub(super) fn start_rename(self: &Rc<Self>) {
+        let selected = self.tab().map(|t| t.selected()).unwrap_or_default();
+        if selected.len() > 1 {
+            self.start_batch_rename();
+            return;
+        }
+        let Ok::<[_; 1], _>([(info, file)]) = selected.try_into() else {
             return;
         };
         let name = info.display_name().to_string();
@@ -3065,9 +2520,13 @@ impl Win {
             }
             let win = win.clone();
             let file = file.clone();
+            let old = name.clone();
             glib::spawn_future_local(async move {
-                if let Err(e) = ops::rename(&file, &new).await {
-                    win.show_message(&e.to_string());
+                match ops::rename(&file, &new).await {
+                    Ok(renamed) => {
+                        win.record("Rename", undo::Change::Renamed(vec![(renamed, old)]));
+                    }
+                    Err(e) => win.show_error(&e.to_string()),
                 }
             });
         });
@@ -3077,14 +2536,16 @@ impl Win {
     fn start_new_folder(self: &Rc<Self>) {
         self.ask("New folder", Some("New Folder"), "Create", |win, name| {
             if let Err(e) = crate::filename::validate(&name) {
-                win.show_message(e);
+                win.show_error(e);
                 return;
             }
-            let dir = win.current.borrow().clone();
+            let Some(tab) = win.tab() else { return };
+            let dir = tab.current.borrow().clone();
             let win = win.clone();
             glib::spawn_future_local(async move {
-                if let Err(e) = ops::new_folder(&dir, &name).await {
-                    win.show_message(&e.to_string());
+                match ops::new_folder(&dir, &name).await {
+                    Ok(made) => win.record("New Folder", undo::Change::Created(vec![made])),
+                    Err(e) => win.show_error(&e.to_string()),
                 }
             });
         });
@@ -3129,6 +2590,9 @@ impl Win {
         ok: &str,
         action: impl Fn(&Rc<Self>, String) + 'static,
     ) {
+        while let Some(child) = self.prompt_extra.first_child() {
+            self.prompt_extra.remove(&child);
+        }
         self.prompt_label.set_text(label);
         self.prompt_ok.set_label(ok);
         self.prompt_entry.set_visible(text.is_some());
@@ -3158,7 +2622,7 @@ impl Win {
 
     /// Steps the icon size by `step` levels (0 resets), restyling the list
     /// and remembering the choice.
-    fn zoom_by(self: &Rc<Self>, step: isize) {
+    pub(super) fn zoom_by(self: &Rc<Self>, step: isize) {
         let old = self.zoom.get();
         let new = if step == 0 {
             ZOOM_DEFAULT
@@ -3168,10 +2632,12 @@ impl Win {
         if new == old {
             return;
         }
-        self.views
-            .remove_css_class(&format!("zoom-{}", ZOOM_LEVELS[old]));
-        self.views
-            .add_css_class(&format!("zoom-{}", ZOOM_LEVELS[new]));
+        for tab in self.all_tabs() {
+            tab.views
+                .remove_css_class(&format!("zoom-{}", ZOOM_LEVELS[old]));
+            tab.views
+                .add_css_class(&format!("zoom-{}", ZOOM_LEVELS[new]));
+        }
         self.zoom.set(new);
         let path = zoom_file();
         if let Some(dir) = path.parent() {
@@ -3190,6 +2656,36 @@ impl Win {
         // an active filter.
         let in_text = RootExt::focus(&self.window).is_some_and(|f| f.is::<gtk::Text>());
         let in_list = !in_text;
+        // Tabs and panes. Ctrl+Tab and Tab are taken here, before GTK uses
+        // them to move focus.
+        let ctrl = gdk::ModifierType::CONTROL_MASK;
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        match key {
+            gdk::Key::Tab | gdk::Key::ISO_Left_Tab | gdk::Key::Page_Down if mods == ctrl => {
+                self.cycle_tab(1);
+                return glib::Propagation::Stop;
+            }
+            gdk::Key::Tab | gdk::Key::ISO_Left_Tab if mods == ctrl | shift => {
+                self.cycle_tab(-1);
+                return glib::Propagation::Stop;
+            }
+            gdk::Key::Page_Up if mods == ctrl => {
+                self.cycle_tab(-1);
+                return glib::Propagation::Stop;
+            }
+            gdk::Key::Tab if mods.is_empty() && in_list && self.split.get() => {
+                self.switch_pane();
+                return glib::Propagation::Stop;
+            }
+            _ => {}
+        }
+        if mods == gdk::ModifierType::ALT_MASK {
+            let n = key.to_unicode().and_then(|c| c.to_digit(10));
+            if let Some(n) = n.filter(|n| *n >= 1) {
+                self.goto_tab(n as usize);
+                return glib::Propagation::Stop;
+            }
+        }
         if key == gdk::Key::Escape && mods.is_empty() && in_list && !self.search.text().is_empty() {
             self.search.set_text("");
             return glib::Propagation::Stop;
@@ -3202,6 +2698,7 @@ impl Win {
                 gdk::Key::c => self.copy_selection(false),
                 gdk::Key::x => self.copy_selection(true),
                 gdk::Key::v => self.paste(),
+                gdk::Key::z => self.undo(),
                 _ => return glib::Propagation::Proceed,
             }
             return glib::Propagation::Stop;
@@ -3261,53 +2758,67 @@ impl Win {
 
         // Window-wide.
         let global = gtk::ShortcutController::new();
-        add(&global, &w, "<Alt>Left", Self::go_back);
-        add(&global, &w, "<Alt>Right", Self::go_forward);
-        add(&global, &w, "<Alt>Up", Self::go_up);
+        add(&global, &w, "<Alt>Left", |win| {
+            if let Some(tab) = win.tab() {
+                tab.go_back();
+            }
+        });
+        add(&global, &w, "<Alt>Right", |win| {
+            if let Some(tab) = win.tab() {
+                tab.go_forward();
+            }
+        });
+        add(&global, &w, "<Alt>Up", |win| {
+            if let Some(tab) = win.tab() {
+                tab.go_up();
+            }
+        });
         add(&global, &w, "<Alt>Home", |win| {
-            win.navigate(gio::File::for_path(glib::home_dir()), true);
+            win.navigate(gio::File::for_path(glib::home_dir()));
         });
         add(&global, &w, "<Control>l", |win| win.show_location());
         add(&global, &w, "<Control>h", |win| {
             win.set_show_hidden(!win.show_hidden.get());
         });
         add(&global, &w, "<Control><Shift>n", Self::start_new_folder);
-        add(&global, &w, "F5", Self::reload);
+        // F5 / F6 copy / move to the other pane while split (as in Midnight
+        // Commander and vifm); F5 reloads otherwise.
+        add(&global, &w, "F5", |win| {
+            if win.split.get() {
+                win.to_other_pane(Kind::Copy);
+            } else {
+                win.reload();
+            }
+        });
+        add(&global, &w, "F6", |win| win.to_other_pane(Kind::Move));
+        add(&global, &w, "F3", |win| win.set_split(!win.split.get()));
+        add(&global, &w, "<Control>u", Self::swap_panes);
         add(&global, &w, "<Control>r", Self::reload);
         add(&global, &w, "<Control>f", |win| {
             win.search.grab_focus();
         });
-        add(&global, &w, "<Control>w", |win| win.window.close());
+        add(&global, &w, "<Control>t", |win| {
+            let here = win.tab().map(|t| t.current.borrow().clone());
+            let file = here.unwrap_or_else(|| gio::File::for_path(glib::home_dir()));
+            win.open_tab(win.active_pane.get(), file, true);
+        });
+        add(&global, &w, "<Control><Shift>t", Self::reopen_closed_tab);
+        add(&global, &w, "<Control>w", |win| {
+            if let Some(tab) = win.tab() {
+                win.close_tab(&tab);
+            }
+        });
+        add(&global, &w, "<Control><Shift>w", |win| win.window.close());
+        add(&global, &w, "<Control>comma", Self::show_preferences);
+        add(&global, &w, "F1", Self::show_shortcuts);
+        add(&global, &w, "<Control>question", Self::show_shortcuts);
         add(&global, &w, "<Control>n", |win| {
             if let Some(app) = win.window.application() {
-                Self::open(&app, Some(win.current.borrow().clone()));
+                let here = win.tab().map(|t| t.current.borrow().clone());
+                Self::open(&app, here);
             }
         });
         win.window.add_controller(global);
-
-        // Only while the file list has focus, so entries keep Ctrl+C etc.
-        let local = gtk::ShortcutController::new();
-        add(&local, &w, "Delete", |win| {
-            let files = win.selected_files();
-            if files.is_empty() {
-                return;
-            }
-            if win.current.borrow().uri_scheme().as_deref() == Some("trash") {
-                win.confirm_delete(files);
-            } else {
-                win.trash(files);
-            }
-        });
-        add(&local, &w, "<Shift>Delete", |win| {
-            let files = win.selected_files();
-            if !files.is_empty() {
-                win.confirm_delete(files);
-            }
-        });
-        add(&local, &w, "F2", Self::start_rename);
-        add(&local, &w, "BackSpace", Self::go_up);
-        add(&local, &w, "Menu", |win| win.show_file_menu(40.0, 40.0));
-        win.views.add_controller(local);
 
         // Esc and Ctrl+Shift+N never reached the shortcut controllers above
         // (the filter's key capture and the list's own key handling get them
@@ -3340,6 +2851,26 @@ impl Win {
             }
         });
 
+        // Middle-click a place: open it in a new tab.
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_MIDDLE);
+        let w = Rc::downgrade(win);
+        click.connect_pressed(move |g, _, _, y| {
+            let Some(win) = w.upgrade() else { return };
+            let Some(row) = win.sidebar.row_at_y(px(y)) else {
+                return;
+            };
+            let Some(index) = win.place_index(row.index()) else {
+                return;
+            };
+            let place = win.places.borrow().get(index).cloned();
+            if let Some(Target::Uri(uri)) = place.map(|p| p.target) {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                win.open_tab(win.active_pane.get(), gio::File::for_uri(&uri), false);
+            }
+        });
+        win.sidebar.add_controller(click);
+
         let w = Rc::downgrade(win);
         win.sidebar.connect_row_activated(move |_, row| {
             let Some(win) = w.upgrade() else { return };
@@ -3347,8 +2878,10 @@ impl Win {
                 return;
             };
             let place = win.places.borrow().get(index).cloned();
-            if let Some(place) = place {
-                win.open_place(&place);
+            match place {
+                Some(p) if matches!(p.target, Target::AddServer) => win.show_add_server(row),
+                Some(p) => win.open_place(&p),
+                None => {}
             }
         });
 
@@ -3372,8 +2905,8 @@ impl Win {
 
     fn open_place(self: &Rc<Self>, place: &Place) {
         match &place.target {
-            Target::Uri(uri) => self.navigate(gio::File::for_uri(uri), true),
-            Target::Prompt(prefix) => self.prompt_location(prefix),
+            Target::Uri(uri) => self.navigate(gio::File::for_uri(uri)),
+            Target::AddServer => {}
             Target::Volume(volume) => {
                 let op = self.auth.operation(None);
                 let win = self.clone();
@@ -3385,11 +2918,11 @@ impl Win {
                     {
                         Ok(()) => {
                             if let Some(root) = volume.get_mount().map(|m| m.root()) {
-                                win.navigate(root, true);
+                                win.navigate(root);
                             }
                         }
                         Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => {}
-                        Err(e) => win.show_message(&e.to_string()),
+                        Err(e) => win.show_error(&e.to_string()),
                     }
                 });
             }
@@ -3398,8 +2931,38 @@ impl Win {
 
     pub fn refresh_sidebar(self: &Rc<Self>) {
         let mut all = places::fixed_places();
-        all.extend(places::volumes(&self.monitor));
+        // Network: shares the system mounts, then GIO's mounts and volumes,
+        // saved servers and Tailscale peers, then Nearby and Add Server.
+        let shares = places::mounted_shares();
+        let share_paths: Vec<PathBuf> = shares
+            .iter()
+            .filter_map(|p| match &p.target {
+                Target::Uri(u) => gio::File::for_uri(u).path(),
+                _ => None,
+            })
+            .collect();
+        all.extend(shares);
+        // A share mounted by the system can also show up as a GIO mount.
+        all.extend(places::volumes(&self.monitor).into_iter().filter(|p| {
+            !matches!(&p.target, Target::Uri(u) if gio::File::for_uri(u)
+                .path()
+                .is_some_and(|path| share_paths.iter().any(|s| path.starts_with(s))))
+        }));
+        let open: Vec<String> = all
+            .iter()
+            .filter_map(|p| match &p.target {
+                Target::Uri(u) => Some(u.trim_end_matches('/').to_owned()),
+                _ => None,
+            })
+            .collect();
+        // A saved server that's mounted already has its row.
+        all.extend(
+            places::saved_servers()
+                .into_iter()
+                .filter(|p| !open.contains(&p.key())),
+        );
         all.extend(self.peers.borrow().iter().cloned());
+        all.extend(places::network_actions());
         // A synced folder that is already a place gets a badge there
         // instead of a second row under Synced.
         for mut synced in places::syncthing_folders() {
@@ -3440,9 +3003,26 @@ impl Win {
         line.append(&gtk::Image::from_icon_name(&place.icon));
         let label = gtk::Label::new(Some(&place.name));
         label.set_xalign(0.0);
-        label.set_hexpand(true);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        line.append(&label);
+        // A second line saying what the row is.
+        if let Some(detail) = &place.detail {
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            text.set_hexpand(true);
+            text.set_valign(gtk::Align::Center);
+            let detail = gtk::Label::new(Some(detail));
+            detail.set_xalign(0.0);
+            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            detail.add_css_class("place-detail");
+            text.append(&label);
+            text.append(&detail);
+            line.append(&text);
+        } else {
+            label.set_hexpand(true);
+            line.append(&label);
+        }
+        if let Some(tip) = &place.tooltip {
+            row.set_tooltip_text(Some(tip));
+        }
         if place.synced && place.section != Section::Synced {
             let badge = gtk::Image::from_icon_name("emblem-synchronizing-symbolic");
             badge.add_css_class("synced-badge");
@@ -3478,7 +3058,7 @@ impl Win {
                 &Rc::downgrade(self),
                 &row,
                 Rc::new(move || Some(gio::File::for_uri(&uri))),
-                false,
+                HoverOpen::No,
             );
         }
 
@@ -3608,7 +3188,7 @@ impl Win {
         };
         keys.insert(if below { to + 1 } else { to }, item);
         if let Err(e) = places::save_order(section, &keys) {
-            self.show_message(&format!("Couldn't save sidebar order: {e}"));
+            self.show_error(&format!("Couldn't save sidebar order: {e}"));
         }
         if section == Section::Places {
             let uris: Vec<String> = self
@@ -3637,13 +3217,27 @@ impl Win {
             .map(|(label, uri)| {
                 let uri = uri.clone();
                 PlaceItem::new(label, true, move |win| {
-                    win.navigate(gio::File::for_uri(&uri), true);
+                    win.navigate(gio::File::for_uri(&uri));
                 })
             })
             .collect();
         let Target::Uri(uri) = &place.target else {
             return items;
         };
+        let u = uri.clone();
+        items.insert(
+            0,
+            PlaceItem::new("Open in New Tab", true, move |win| {
+                win.open_tab(win.active_pane.get(), gio::File::for_uri(&u), true);
+            }),
+        );
+        let u = uri.clone();
+        items.insert(
+            1,
+            PlaceItem::new("Open in Other Pane", true, move |win| {
+                win.open_in_other_pane(gio::File::for_uri(&u));
+            }),
+        );
         if uri == "trash:///" {
             let full = places::trash_count() > 0;
             items.push(PlaceItem::new("Restore All", full, Self::restore_all));
@@ -3652,6 +3246,14 @@ impl Win {
                 full,
                 Self::confirm_empty_trash,
             ));
+        } else if place.saved_server {
+            let uri = uri.clone();
+            items.push(PlaceItem::new("Forget Server", true, move |win| {
+                if let Err(e) = places::forget_server(&uri) {
+                    win.show_error(&format!("Couldn't forget the server: {e}"));
+                }
+                win.refresh_sidebar();
+            }));
         } else if place.section == Section::Places && places::is_bookmark(uri) {
             let uri = uri.clone();
             items.push(PlaceItem::new("Remove Bookmark", true, move |win| {
@@ -3713,12 +3315,14 @@ impl Win {
     fn unmount(self: &Rc<Self>, mount: gio::Mount) {
         // Leave the mount first if we're inside it.
         let root = mount.root();
-        let inside = {
-            let cur = self.current.borrow();
-            cur.equal(&root) || cur.has_prefix(&root)
-        };
-        if inside {
-            self.navigate(gio::File::for_path(glib::home_dir()), true);
+        for tab in self.all_tabs() {
+            let inside = {
+                let cur = tab.current.borrow();
+                cur.equal(&root) || cur.has_prefix(&root)
+            };
+            if inside {
+                tab.navigate(gio::File::for_path(glib::home_dir()), true);
+            }
         }
         let op = self.auth.operation(Some(&root.uri()));
         let win = self.clone();
@@ -3734,7 +3338,7 @@ impl Win {
             };
             if let Err(e) = result {
                 if !e.matches(gio::IOErrorEnum::FailedHandled) {
-                    win.show_message(&e.to_string());
+                    win.show_error(&e.to_string());
                 }
             }
         });
@@ -3756,8 +3360,8 @@ impl Win {
                 // The sidebar is rebuilt only when something changed.
                 let key = |p: &Place| {
                     let uri = match &p.target {
-                        Target::Uri(u) | Target::Prompt(u) => u.clone(),
-                        Target::Volume(_) => String::new(),
+                        Target::Uri(u) => u.clone(),
+                        Target::Volume(_) | Target::AddServer => String::new(),
                     };
                     (p.name.clone(), uri, p.dim, p.alternates.clone())
                 };
@@ -3783,7 +3387,8 @@ impl Win {
     }
 
     fn select_sidebar_row(&self) {
-        let current = self.current.borrow().uri().to_string();
+        let Some(tab) = self.tab() else { return };
+        let current = tab.current.borrow().uri().to_string();
         let index = self.places.borrow().iter().position(|p| match &p.target {
             Target::Uri(u) => u.trim_end_matches('/') == current.trim_end_matches('/'),
             _ => false,
@@ -3804,46 +3409,25 @@ impl Win {
 
     // ------------------------------------------------------------- footer --
 
-    fn update_status(&self) {
-        let total = self.sorted.n_items();
-        let state = self.search_state.get();
-        let loading = self.list.borrow().is_loading() || state == SearchState::Running;
-        self.empty.set_visible(total == 0 && !loading);
-        self.empty.set_text(if self.search.text().is_empty() {
-            "Nothing here"
-        } else {
-            "No matches"
-        });
-        let matches = if total == 1 { "match" } else { "matches" };
-        let mut text = match state {
-            SearchState::Running => format!("{total} {matches} so far, searching subfolders…"),
-            SearchState::Done if usize::try_from(total).unwrap_or(0) >= search::MAX_RESULTS => {
-                format!("First {total} matches here and in subfolders; type more to narrow")
-            }
-            SearchState::Done => format!("{total} {matches} here and in subfolders"),
-            SearchState::Off if loading && total == 0 => "Loading…".to_string(),
-            SearchState::Off => format!("{total} item{}", if total == 1 { "" } else { "s" }),
-        };
-        // Count and size straight from the selection (no list of files).
-        let set = self.selection.selection();
-        if !set.is_empty() {
-            let mut bytes = 0;
-            if let Some((iter, first)) = gtk::BitsetIter::init_first(&set) {
-                for pos in std::iter::once(first).chain(iter) {
-                    if let Some(info) = self.item(pos).filter(|i| !is_dir(i)) {
-                        bytes += ops::size_of(&info);
-                    }
-                }
-            }
-            let _ = write!(text, " · {} selected", set.size());
-            if bytes > 0 {
-                let _ = write!(text, " ({})", glib::format_size(bytes));
-            }
+    /// The footer shows the active tab's counts and selection.
+    pub(super) fn update_status(&self) {
+        if let Some(tab) = self.tab() {
+            self.status.set_text(&tab.status_text());
         }
-        self.status.set_text(&text);
     }
 
-    fn show_message(&self, text: &str) {
+    /// Reports a failure in the error bar, which slides up from the bottom
+    /// (`show_message` is for passing news, in the footer).
+    pub(super) fn show_error(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Not twice: the footer line goes.
+        self.show_message("");
+        self.errors.show(text);
+    }
+
+    pub(super) fn show_message(&self, text: &str) {
         self.message.set_text(text);
         let seq = self.message_seq.get().wrapping_add(1);
         self.message_seq.set(seq);

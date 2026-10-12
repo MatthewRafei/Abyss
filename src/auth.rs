@@ -82,6 +82,13 @@ pub struct AuthBar {
     keyring: bool,
 }
 
+/// Who a password prompt is for, and whether it's asked again because the
+/// last answer was refused.
+struct Asking {
+    server: Option<String>,
+    refused: bool,
+}
+
 const REMEMBER: [(&str, gio::PasswordSave); 3] = [
     ("Don't remember", gio::PasswordSave::Never),
     ("Until logout", gio::PasswordSave::ForSession),
@@ -225,6 +232,24 @@ impl AuthBar {
         self.revealer.add_controller(keys);
     }
 
+    /// Takes down a prompt that's no longer wanted (its connection was
+    /// stopped), answering it as cancelled.
+    pub fn dismiss(&self) {
+        if self.pending.borrow().is_some() {
+            self.finish(gio::MountOperationResult::Aborted);
+        }
+    }
+
+    /// Calls `f` with whether the bar is asking, as that changes.
+    pub fn connect_asking(&self, f: impl Fn(bool) + 'static) -> glib::SignalHandlerId {
+        self.revealer
+            .connect_reveal_child_notify(move |r| f(r.reveals_child()))
+    }
+
+    pub fn disconnect(&self, id: glib::SignalHandlerId) {
+        self.revealer.disconnect(id);
+    }
+
     /// A mount operation for `target` (a location URI, if known) whose
     /// prompts go to this bar.
     pub fn operation(self: &Rc<Self>, target: Option<&str>) -> gio::MountOperation {
@@ -233,9 +258,15 @@ impl AuthBar {
         // Set once this operation has been answered from the cache, so a
         // second prompt means the server rejected those credentials.
         let used_cache = Rc::new(Cell::new(false));
+        // Prompts so far: asked again means the last answer was refused.
+        let asked = Cell::new(0_u32);
 
         let me = Rc::downgrade(self);
         op.connect_ask_password(move |op, message, user, domain, flags| {
+            // Ours to answer: GIO's own handler would otherwise reply
+            // "unhandled" from an idle while the bar waits, and the server
+            // gives up ("Permission denied") before anyone can sign in.
+            op.stop_signal_emission_by_name("ask-password");
             let Some(bar) = me.upgrade() else {
                 op.reply(gio::MountOperationResult::Unhandled);
                 return;
@@ -250,12 +281,19 @@ impl AuthBar {
                     return;
                 }
             }
-            bar.ask_password(op, message, user, domain, flags, server.clone());
+            let refused = asked.replace(asked.get() + 1) > 0 || used_cache.get();
+            let to = Asking {
+                server: server.clone(),
+                refused,
+            };
+            bar.ask_password(op, message, user, domain, flags, to);
         });
         let me = Rc::downgrade(self);
         // gio-rs has no typed binding for this signal.
         op.connect_local("ask-question", false, move |args| {
             let op = args.first()?.get::<gio::MountOperation>().ok()?;
+            // As for passwords: keep GIO's handler from answering too.
+            op.stop_signal_emission_by_name("ask-question");
             let message = args.get(1)?.get::<String>().unwrap_or_default();
             let choices: Vec<String> = args
                 .get(2)
@@ -297,8 +335,9 @@ impl AuthBar {
         user: &str,
         domain: &str,
         flags: gio::AskPasswordFlags,
-        server: Option<String>,
+        to: Asking,
     ) {
+        let Asking { server, refused } = to;
         self.take_bar(op, server);
         let mut lines = message.lines();
         let first = lines.next().unwrap_or("Sign in");
@@ -308,11 +347,25 @@ impl AuthBar {
         } else {
             ("Authentication Required", message.to_owned())
         };
-        self.title.set_text(title);
-        self.detail.set_text(detail.trim_end_matches(':'));
-        self.detail.set_visible(!detail.is_empty());
+        // Asked again: say so, or it looks like nothing happened.
+        if refused {
+            self.title.set_text("Sign-in failed");
+            self.title.add_css_class("refused");
+            self.detail.set_text(
+                "The server didn't accept that user name and password. Check them and try again.",
+            );
+            self.detail.set_visible(true);
+        } else {
+            self.title.set_text(title);
+            self.title.remove_css_class("refused");
+            self.detail.set_text(detail.trim_end_matches(':'));
+            self.detail.set_visible(!detail.is_empty());
+        }
 
-        self.user.set_text(user);
+        // Keep the user name just tried over the server's suggestion.
+        if !refused || self.user.text().is_empty() {
+            self.user.set_text(user);
+        }
         self.domain.set_text(domain);
         self.password.set_text("");
         self.user

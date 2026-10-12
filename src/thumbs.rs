@@ -15,7 +15,9 @@
 //! (ffmpeg), PDF/PostScript (pdftoppm or Ghostscript), office documents
 //! (gsf-office), EPUB / comic covers (bsdtar), fonts (ImageMagick),
 //! text and code (first lines drawn as a page), archives (their file list),
-//! and any other installed `.thumbnailer`. Queueing follows
+//! and any other installed `.thumbnailer`. Only images and video are
+//! thumbnailed for now (`SHOWN`); other files show their type's icon.
+//! Queueing follows
 //! nautilus-thumbnails.c, newest request first, but several renders run at
 //! once (one per two cores); decoding, scaling and cache lookups happen off
 //! the UI thread. Only local files are thumbnailed.
@@ -368,11 +370,16 @@ fn can_thumbnail(file: &gio::File, info: &gio::FileInfo) -> bool {
     let Some(ct) = crate::info::content_type(info) else {
         return false;
     };
-    let Some(kind) = kind_for(&ct) else {
-        return false;
-    };
-    kind != Kind::Image || crate::ops::size_of(info) <= MAX_IMAGE_BYTES
+    match kind_for(&ct) {
+        Some(Kind::Image) => crate::ops::size_of(info) <= MAX_IMAGE_BYTES,
+        Some(kind) => SHOWN.contains(&kind),
+        None => false,
+    }
 }
+
+/// The kinds that get thumbnails; everything else shows its type's icon.
+/// The other renderers are kept: add a kind here to bring it back.
+const SHOWN: [Kind; 2] = [Kind::Image, Kind::Video];
 
 /// The file's thumbnail, from the cache or freshly made; None if it has
 /// none. The cache is checked on a worker thread, not the UI thread.
@@ -385,7 +392,12 @@ pub async fn thumbnail(file: &gio::File, info: &gio::FileInfo) -> Option<PathBuf
     let own = cache_path(&key);
     let failed = fail_path(&key);
     let shared = shared_candidates(&stamp.uri, edge());
-    let found = gio::spawn_blocking(move || {
+    // A tile scrolled past before its turn came drops this future; the
+    // flag then lets the queued lookup skip its disk work.
+    let found = crate::par::blocking(move |stop| {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(());
+        }
         if own.exists() {
             return Ok(Some(own));
         }
@@ -399,8 +411,7 @@ pub async fn thumbnail(file: &gio::File, info: &gio::FileInfo) -> Option<PathBuf
             Ok(None)
         }
     })
-    .await
-    .ok()?;
+    .await?;
     match found {
         Ok(Some(path)) => Some(path),
         Ok(None) => request(file, info).await,
@@ -1016,9 +1027,12 @@ async fn generate(job: &Job) -> Option<PathBuf> {
 fn save(source: &Path, out: &Path, fail: &Path, stamp: &Stamp, edge: u32) -> bool {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let max_px = i32::try_from(edge).unwrap_or(256);
-    let pixbuf = gdk_pixbuf::Pixbuf::from_file(source).ok().and_then(|p| {
-        if p.width() <= max_px && p.height() <= max_px {
-            Some(p)
+    // Read the size from the header and decode straight to the thumbnail's
+    // size: the loader scales while decoding (JPEG decodes at a fraction of
+    // full size), so a 12-megapixel photo is never held in memory whole.
+    let pixbuf = gdk_pixbuf::Pixbuf::file_info(source).and_then(|(_, w, h)| {
+        if w <= max_px && h <= max_px {
+            gdk_pixbuf::Pixbuf::from_file(source).ok()
         } else {
             gdk_pixbuf::Pixbuf::from_file_at_scale(source, max_px, max_px, true).ok()
         }
@@ -1110,9 +1124,14 @@ pub async fn texture(path: PathBuf, px: i32) -> Option<gdk::Texture> {
         return Some(t);
     }
     let file = key.0.clone();
-    let texture = gio::spawn_blocking(move || decode(&file, px))
-        .await
-        .ok()??;
+    let texture = crate::par::blocking(move |stop| {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else {
+            decode(&file, px)
+        }
+    })
+    .await??;
     TEXTURES.with_borrow_mut(|c| {
         let size = texture_bytes(&texture);
         if let Some(old) = c.map.insert(key.clone(), texture.clone()) {

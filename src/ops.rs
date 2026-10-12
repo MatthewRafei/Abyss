@@ -65,6 +65,17 @@ const PRIO: glib::Priority = glib::Priority::DEFAULT;
 /// seek between them.
 const BIG_FILE: u64 = 64 * 1024 * 1024;
 
+/// `G_FILE_COPY_TARGET_DEFAULT_MODIFIED_TIME` (GLib 2.80; older versions
+/// ignore it and set the time themselves). Copies leave the time alone and
+/// get it at the end of the job: setting it right after writing makes the
+/// file system send the data off first, which on a network share is a
+/// round trip per file (2,000 small files to SMB: 27 s one by one).
+const TARGET_DEFAULT_MODIFIED_TIME: gio::FileCopyFlags =
+    gio::FileCopyFlags::from_bits_retain(1 << 6);
+
+/// Copies waiting for their modified time at most.
+const STAMP_BATCH: usize = 4096;
+
 fn err(msg: impl AsRef<str>) -> glib::Error {
     glib::Error::new(gio::IOErrorEnum::Failed, msg.as_ref())
 }
@@ -310,6 +321,20 @@ struct Job {
     replace_all: Cell<bool>,
     merge_all: Cell<bool>,
     skip_all: Cell<bool>,
+    /// Copies whose modified time is still the source's to give them
+    /// (see `TARGET_DEFAULT_MODIFIED_TIME`).
+    stamps: RefCell<Vec<(gio::File, gio::FileInfo)>>,
+    /// What this job made, for undoing it (see `Placed`).
+    placed: RefCell<Placed>,
+}
+
+/// What a copy or move made: each item that didn't exist before, with the
+/// item it came from (inside merged folders too), and how many existing
+/// files were replaced (those can't be put back).
+#[derive(Default, Debug)]
+pub struct Placed {
+    pub fresh: Vec<(gio::File, gio::File)>,
+    pub replaced: usize,
 }
 
 impl Job {
@@ -325,7 +350,21 @@ impl Job {
             replace_all: Cell::new(false),
             merge_all: Cell::new(false),
             skip_all: Cell::new(false),
+            stamps: RefCell::default(),
+            placed: RefCell::default(),
         })
+    }
+
+    /// Gives the copies made so far their source's modified time, all at
+    /// once now that their contents are written.
+    async fn stamp(&self) -> Result<(), glib::Error> {
+        let stamps = std::mem::take(&mut *self.stamps.borrow_mut());
+        concurrently(stamps, |(file, info)| async move {
+            file.set_attributes_future(&info, gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, PRIO)
+                .await
+                .map(|_| ())
+        })
+        .await
     }
 
     fn emit(&self) {
@@ -365,7 +404,7 @@ fn copy_tree(
         let permit = job.limit.take(1).await;
         let info = src
             .query_info_future(
-                "standard::type,standard::size,standard::name",
+                "standard::type,standard::size,standard::name,time::modified,time::modified-usec",
                 gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                 PRIO,
             )
@@ -396,7 +435,10 @@ fn copy_tree(
         } else {
             permit
         };
-        let mut flags = gio::FileCopyFlags::NOFOLLOW_SYMLINKS | gio::FileCopyFlags::ALL_METADATA;
+        // Not ALL_METADATA: it adds the access time, which is set the same
+        // slow way. Permissions and extended attributes still come along;
+        // the owner only could for root.
+        let mut flags = gio::FileCopyFlags::NOFOLLOW_SYMLINKS | TARGET_DEFAULT_MODIFIED_TIME;
         if overwrite {
             flags |= gio::FileCopyFlags::OVERWRITE;
         }
@@ -415,6 +457,19 @@ fn copy_tree(
         job.copying.borrow_mut().remove(&id);
         drop(permit);
         result?;
+        if info.file_type() == gio::FileType::Regular {
+            let stamp = gio::FileInfo::new();
+            stamp.set_attribute_uint64("time::modified", info.attribute_uint64("time::modified"));
+            stamp.set_attribute_uint32(
+                "time::modified-usec",
+                info.attribute_uint32("time::modified-usec"),
+            );
+            job.stamps.borrow_mut().push((dst, stamp));
+            // A huge copy stamps as it goes, so the list stays small.
+            if job.stamps.borrow().len() >= STAMP_BATCH {
+                job.stamp().await?;
+            }
+        }
         job.file_done(size);
         Ok(())
     })
@@ -562,6 +617,7 @@ async fn place_all(
     let out = &out;
     let fast = concurrently(free, |(i, src, target)| async move {
         put(job, &src, &target, kind, false).await?;
+        job.placed.borrow_mut().fresh.push((src, target.clone()));
         out.borrow_mut()[i] = Some(target);
         Ok(())
     });
@@ -595,6 +651,7 @@ fn place(
         loop {
             let Ok(dest_info) = target.query_info_future(attrs, nofollow, PRIO).await else {
                 put(&job, &src, &target, kind, false).await?;
+                job.placed.borrow_mut().fresh.push((src, target.clone()));
                 return Ok(Some(target));
             };
             let dest_dir = dest_info.file_type() == gio::FileType::Directory;
@@ -669,6 +726,7 @@ fn place(
                 }
                 Choice::Replace if can_replace => {
                     put(&job, &src, &target, kind, true).await?;
+                    job.placed.borrow_mut().replaced += 1;
                     return Ok(Some(target));
                 }
                 // Replace isn't offered here; ask again.
@@ -679,13 +737,46 @@ fn place(
 }
 
 /// Copies or moves `sources` into `dest`, asking `resolve` about name
-/// clashes. Returns the files created.
+/// clashes. Returns the files created. (The app uses `transfer_logged`.)
+#[cfg(test)]
 pub async fn transfer(
     sources: Vec<gio::File>,
     dest: gio::File,
     kind: Kind,
     report: Report,
     resolve: Resolver,
+) -> Result<Vec<gio::File>, glib::Error> {
+    transfer_logged(sources, dest, kind, report, resolve)
+        .await
+        .0
+}
+
+/// `transfer`, also saying what it placed (for undo), even when it stopped
+/// part way: what was done by then still is.
+pub async fn transfer_logged(
+    sources: Vec<gio::File>,
+    dest: gio::File,
+    kind: Kind,
+    report: Report,
+    resolve: Resolver,
+) -> (Result<Vec<gio::File>, glib::Error>, Placed) {
+    let job = Rc::new(RefCell::new(None::<Rc<Job>>));
+    let result = transfer_in(sources, dest, kind, report, resolve, &job).await;
+    let placed = job
+        .borrow()
+        .as_ref()
+        .map(|j| std::mem::take(&mut *j.placed.borrow_mut()))
+        .unwrap_or_default();
+    (result, placed)
+}
+
+async fn transfer_in(
+    sources: Vec<gio::File>,
+    dest: gio::File,
+    kind: Kind,
+    report: Report,
+    resolve: Resolver,
+    job_out: &RefCell<Option<Rc<Job>>>,
 ) -> Result<Vec<gio::File>, glib::Error> {
     for src in &sources {
         if dest.equal(src) || dest.has_prefix(src) {
@@ -710,6 +801,7 @@ pub async fn transfer(
         report,
         resolve,
     );
+    job_out.replace(Some(job.clone()));
     job.emit();
 
     let mut pairs = Vec::new();
@@ -728,11 +820,10 @@ pub async fn transfer(
         };
         pairs.push((src, target));
     }
-    Ok(place_all(&job, pairs, kind)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect())
+    // Stamped even when the job stops early: what was copied is complete.
+    let placed = place_all(&job, pairs, kind).await;
+    job.stamp().await?;
+    Ok(placed?.into_iter().flatten().collect())
 }
 
 pub async fn trash(files: Vec<gio::File>) -> Result<(), glib::Error> {
@@ -753,6 +844,78 @@ pub async fn empty_trash() -> Result<(), glib::Error> {
         async move { item.delete_future(PRIO).await }
     })
     .await
+}
+
+/// Puts items back from the trash to where they were (`origs`), taking the
+/// one trashed last when a place was trashed more than once. A place that's
+/// taken again gets a free name beside it.
+pub async fn untrash(origs: &[gio::File]) -> Result<(), glib::Error> {
+    let trash = gio::File::for_uri("trash:///");
+    let items = children(
+        &trash,
+        "standard::name,standard::type,trash::orig-path,trash::deletion-date",
+    )
+    .await?;
+    for orig in origs {
+        let Some(path) = orig.path() else { continue };
+        let found = items
+            .iter()
+            .filter(|i| {
+                i.attribute_byte_string("trash::orig-path")
+                    .is_some_and(|p| Path::new(p.as_str()) == path)
+            })
+            .max_by_key(|i| {
+                i.attribute_string("trash::deletion-date")
+                    .unwrap_or_default()
+            });
+        let Some(info) = found else {
+            return Err(err(format!(
+                "“{}” is no longer in the trash",
+                display_name(orig)
+            )));
+        };
+        let parent = orig.parent().ok_or_else(|| err("No parent folder"))?;
+        let dir = parent.clone();
+        let _ =
+            gio::spawn_blocking(move || dir.make_directory_with_parents(gio::Cancellable::NONE))
+                .await;
+        let is_dir = info.file_type() == gio::FileType::Directory;
+        let target = if exists(orig).await {
+            free_target(&parent, &display_name(orig), is_dir, false).await
+        } else {
+            orig.clone()
+        };
+        let (mv, _) = trash.child(info.name()).move_future(
+            &target,
+            gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
+            PRIO,
+        );
+        mv.await?;
+    }
+    Ok(())
+}
+
+/// Moves each `(from, to)` back: what's at `to` goes to `from`, last first,
+/// remaking `from`'s folder if a merge removed it. Refuses to replace
+/// anything that's at `from` now.
+pub async fn move_back(pairs: &[(gio::File, gio::File)]) -> Result<(), glib::Error> {
+    for (from, to) in pairs.iter().rev() {
+        if exists(from).await {
+            return Err(err(format!(
+                "“{}” can't go back: something else is there now",
+                display_name(from)
+            )));
+        }
+        if let Some(parent) = from.parent() {
+            let _ = gio::spawn_blocking(move || {
+                parent.make_directory_with_parents(gio::Cancellable::NONE)
+            })
+            .await;
+        }
+        let (mv, _) = to.move_future(from, gio::FileCopyFlags::NOFOLLOW_SYMLINKS, PRIO);
+        mv.await?;
+    }
+    Ok(())
 }
 
 /// Every item in `trash` paired with the location it was trashed from.
@@ -810,6 +973,94 @@ pub async fn new_file_with_contents(
     Ok(target)
 }
 
+/// Total bytes and entries under `files` (each counted too), for sizes and
+/// progress bars.
+pub async fn count(files: &[gio::File]) -> (u64, u64) {
+    measure(files).await
+}
+
+/// Renames each file to its new name, as one step: through temporary names
+/// first, so names can be swapped or shifted along (a→b while b→c) without
+/// one rename landing on a file still to go. On a failure, what was renamed
+/// goes back. Returns the renamed files, in order.
+pub async fn rename_many(renames: Vec<(gio::File, String)>) -> Result<Vec<gio::File>, glib::Error> {
+    for (_, name) in &renames {
+        filename::validate(name).map_err(err)?;
+    }
+    let stamp = format!(
+        ".abyss-rename-{}-{}",
+        std::process::id(),
+        glib::monotonic_time()
+    );
+    // Phase one: everything to a temporary name beside it.
+    let mut parked: Vec<(gio::File, gio::File, String)> = Vec::with_capacity(renames.len());
+    for (i, (file, name)) in renames.into_iter().enumerate() {
+        match file
+            .set_display_name_future(&format!("{stamp}-{i}"), PRIO)
+            .await
+        {
+            Ok(tmp) => parked.push((tmp, file, name)),
+            Err(e) => {
+                for (tmp, _, _) in parked.iter().rev() {
+                    let _ = tmp
+                        .set_display_name_future(&old_name_of(tmp, &parked), PRIO)
+                        .await;
+                }
+                return Err(e);
+            }
+        }
+    }
+    // Phase two: temporary names to the new ones, refusing to replace a
+    // file that was already there.
+    let mut done = Vec::with_capacity(parked.len());
+    for (k, (tmp, _, name)) in parked.iter().enumerate() {
+        let target = tmp.parent().map(|p| p.child(name));
+        if target
+            .as_ref()
+            .is_some_and(|t| t.query_exists(gio::Cancellable::NONE))
+        {
+            let e = err(format!("“{name}” already exists"));
+            rollback(&parked[..k], &done, &parked[k..]).await;
+            return Err(e);
+        }
+        match tmp.set_display_name_future(name, PRIO).await {
+            Ok(new) => done.push(new),
+            Err(e) => {
+                rollback(&parked[..k], &done, &parked[k..]).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// The name a parked file had before `rename_many` (its original file's).
+fn old_name_of(tmp: &gio::File, parked: &[(gio::File, gio::File, String)]) -> String {
+    parked.iter().find(|(t, _, _)| t.equal(tmp)).map_or_else(
+        || display_name(tmp),
+        |(_, original, _)| display_name(original),
+    )
+}
+
+/// Undoes a `rename_many` that failed part way: renamed files and still
+/// parked ones all get their original names back.
+async fn rollback(
+    renamed: &[(gio::File, gio::File, String)],
+    now: &[gio::File],
+    parked: &[(gio::File, gio::File, String)],
+) {
+    for ((_, original, _), file) in renamed.iter().zip(now) {
+        let _ = file
+            .set_display_name_future(&display_name(original), PRIO)
+            .await;
+    }
+    for (tmp, original, _) in parked {
+        let _ = tmp
+            .set_display_name_future(&display_name(original), PRIO)
+            .await;
+    }
+}
+
 pub async fn rename(file: &gio::File, name: &str) -> Result<gio::File, glib::Error> {
     filename::validate(name).map_err(err)?;
     file.set_display_name_future(name, PRIO).await
@@ -826,6 +1077,17 @@ mod tests {
         std::fs::create_dir_all(dir.join("dst")).unwrap();
         std::fs::write(dir.join("src/a.txt"), "hello").unwrap();
         std::fs::write(dir.join("src/sub/b.txt"), "world").unwrap();
+        // An old time, so a copy that didn't keep it would show.
+        let old =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(1_000_000_123_456);
+        for f in ["src/a.txt", "src/sub/b.txt"] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(f))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
         dir
     }
 
@@ -864,6 +1126,10 @@ mod tests {
                 std::fs::read_to_string(dir.join("dst/sub/b.txt")).unwrap(),
                 "world"
             );
+            // Copies keep their source's modified time (set at the end).
+            let mtime = |p: &str| std::fs::metadata(dir.join(p)).unwrap().modified().unwrap();
+            assert_eq!(mtime("dst/sub/b.txt"), mtime("src/sub/b.txt"));
+            assert_eq!(mtime("dst/a.txt"), mtime("src/a.txt"));
             // Renaming on a clash suggests "(2)".
             transfer(
                 vec![f("src/a.txt")],
@@ -1112,6 +1378,101 @@ mod tests {
             .await
             .unwrap();
             assert!(!dir.join("src/sub").exists());
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_many_swaps_and_rolls_back() {
+        let dir = tmpdir("rename-many");
+        let f = |p: &str| gio::File::for_path(dir.join(p));
+        let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+        for (name, text) in [("a", "A"), ("b", "B"), ("x", "X"), ("y", "Y")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        run(async {
+            // A swap, and a chain where each name is the next one's old name.
+            rename_many(vec![(f("a"), "b".into()), (f("b"), "a".into())])
+                .await
+                .unwrap();
+            assert_eq!((read("a"), read("b")), ("B".into(), "A".into()));
+            rename_many(vec![(f("x"), "y".into()), (f("y"), "z".into())])
+                .await
+                .unwrap();
+            assert_eq!((read("y"), read("z")), ("X".into(), "Y".into()));
+            // Onto a file that stays: refused, and everything as it was.
+            assert!(
+                rename_many(vec![(f("a"), "q".into()), (f("b"), "z".into())])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                (read("a"), read("b"), read("z")),
+                ("B".into(), "A".into(), "Y".into())
+            );
+            assert!(!dir.join("q").exists());
+            let leftovers = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with(".abyss-rename"));
+            assert!(!leftovers);
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn placed_and_moved_back() {
+        let dir = tmpdir("undo");
+        let f = |p: &str| gio::File::for_path(dir.join(p));
+        let quiet: Report = Rc::new(|_| {});
+        let replace = answer(|_| Choice::Replace);
+        run(async {
+            // A move notes each item; moving back undoes it.
+            let (done, placed) = transfer_logged(
+                vec![f("src/a.txt"), f("src/sub")],
+                f("dst"),
+                Kind::Move,
+                quiet.clone(),
+                replace.clone(),
+            )
+            .await;
+            done.unwrap();
+            assert_eq!(placed.fresh.len(), 2);
+            assert_eq!(placed.replaced, 0);
+            assert!(!dir.join("src/a.txt").exists());
+            move_back(&placed.fresh).await.unwrap();
+            assert!(dir.join("src/a.txt").exists() && dir.join("src/sub/b.txt").exists());
+            assert!(!dir.join("dst/a.txt").exists() && !dir.join("dst/sub").exists());
+            // Replacing an existing file is counted, not noted as new.
+            std::fs::write(dir.join("dst/a.txt"), "old").unwrap();
+            let (done, placed) = transfer_logged(
+                vec![f("src/a.txt")],
+                f("dst"),
+                Kind::Copy,
+                quiet.clone(),
+                replace.clone(),
+            )
+            .await;
+            done.unwrap();
+            assert_eq!((placed.fresh.len(), placed.replaced), (0, 1));
+            // Merging into a folder notes only what went in, so undoing
+            // leaves what was there before.
+            std::fs::create_dir_all(dir.join("dst/sub")).unwrap();
+            std::fs::write(dir.join("dst/sub/mine.txt"), "keep").unwrap();
+            let (done, placed) = transfer_logged(
+                vec![f("src/sub")],
+                f("dst"),
+                Kind::Move,
+                quiet.clone(),
+                replace.clone(),
+            )
+            .await;
+            done.unwrap();
+            assert_eq!(placed.fresh.len(), 1);
+            move_back(&placed.fresh).await.unwrap();
+            assert!(dir.join("dst/sub/mine.txt").exists());
+            assert!(!dir.join("dst/sub/b.txt").exists());
+            assert!(dir.join("src/sub/b.txt").exists());
         });
         std::fs::remove_dir_all(&dir).unwrap();
     }

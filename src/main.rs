@@ -8,11 +8,14 @@ mod chooser;
 mod dnd;
 mod filename;
 mod info;
+mod listing;
 mod ops;
 mod par;
 mod places;
+mod prefs;
 mod search;
 mod section;
+mod starred;
 mod thumbs;
 mod window;
 

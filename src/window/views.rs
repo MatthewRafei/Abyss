@@ -10,6 +10,7 @@
 //!
 //! The choice is remembered in `~/.config/abyss/view`.
 
+use super::tab::Tab;
 use super::*;
 use crate::section;
 
@@ -143,30 +144,6 @@ fn find_category(info: &gio::FileInfo) -> u8 {
 
 impl Win {
     pub(super) fn setup_views(win: &Rc<Self>) {
-        win.grid.set_factory(Some(&Self::tile_factory(win, false)));
-        let w = Rc::downgrade(win);
-        win.grid.connect_activate(move |_, pos| {
-            if let Some(win) = w.upgrade() {
-                win.activate(pos);
-            }
-        });
-        win.groups.set_factory(Some(&Self::tile_factory(win, true)));
-        // A new layout may land on a different number of columns.
-        let w = Rc::downgrade(win);
-        win.grouped_model.connect_items_changed(move |_, _, _, _| {
-            if let Some(win) = w.upgrade() {
-                win.sync_group_columns();
-            }
-        });
-        let w = Rc::downgrade(win);
-        win.groups.connect_activate(move |_, pos| {
-            if let Some(win) = w.upgrade() {
-                if let Some(pos) = win.grouped_model.file_at(pos) {
-                    win.activate(pos);
-                }
-            }
-        });
-
         let w = Rc::downgrade(win);
         win.list_btn.connect_toggled(move |b| {
             if let (Some(win), true) = (w.upgrade(), b.is_active()) {
@@ -185,6 +162,12 @@ impl Win {
                 win.set_view(win.mode.get(), b.is_active());
             }
         });
+        let w = Rc::downgrade(win);
+        win.split_btn.connect_toggled(move |b| {
+            if let Some(win) = w.upgrade() {
+                win.set_split(b.is_active());
+            }
+        });
 
         win.apply_view();
 
@@ -197,10 +180,6 @@ impl Win {
             glib::idle_add_local_once(move || {
                 if let Some(win) = w.upgrade() {
                     win.update_toolbar_layout(width);
-                    // The grouped grid's rows depend on how many columns fit.
-                    if win.mode.get() == Mode::Grid && win.grouped.get() {
-                        win.sync_group_columns();
-                    }
                 }
             });
         });
@@ -231,6 +210,126 @@ impl Win {
         self.search.set_hexpand(compact);
     }
 
+    /// Remakes every tab's grid tiles (after a zoom change, which resizes
+    /// their thumbnail slots).
+    pub(super) fn refresh_tiles(&self) {
+        for tab in self.all_tabs() {
+            tab.refresh_tiles();
+        }
+    }
+
+    pub(super) fn set_view(self: &Rc<Self>, mode: Mode, grouped: bool) {
+        if self.mode.get() == mode && self.grouped.get() == grouped {
+            return;
+        }
+        self.mode.set(mode);
+        self.grouped.set(grouped);
+        save_view(mode, grouped);
+        self.apply_view();
+    }
+
+    /// The view mode is the window's: every tab follows it.
+    fn apply_view(&self) {
+        let (mode, grouped) = (self.mode.get(), self.grouped.get());
+        // The buttons reflect the state (their handlers ignore no-op changes).
+        self.list_btn.set_active(mode == Mode::List);
+        self.grid_btn.set_active(mode == Mode::Grid);
+        self.group_btn.set_active(grouped);
+        for tab in self.all_tabs() {
+            tab.apply_view();
+        }
+    }
+
+    pub(super) fn focus_view(&self) {
+        if let Some(tab) = self.tab() {
+            tab.focus_view();
+        }
+    }
+}
+
+impl Tab {
+    pub(super) fn setup_views(tab: &Rc<Self>) {
+        tab.grid.set_factory(Some(&Self::tile_factory(tab, false)));
+        let w = Rc::downgrade(tab);
+        tab.grid.connect_activate(move |_, pos| {
+            if let Some(tab) = w.upgrade() {
+                tab.activate(pos);
+            }
+        });
+        tab.groups.set_factory(Some(&Self::tile_factory(tab, true)));
+        // A new layout may land on a different number of columns.
+        let w = Rc::downgrade(tab);
+        tab.grouped_model.connect_items_changed(move |_, _, _, _| {
+            if let Some(tab) = w.upgrade() {
+                tab.sync_columns();
+            }
+        });
+        let w = Rc::downgrade(tab);
+        tab.groups.connect_activate(move |_, pos| {
+            if let Some(tab) = w.upgrade() {
+                if let Some(pos) = tab.grouped_model.file_at(pos) {
+                    tab.activate(pos);
+                }
+            }
+        });
+        // The grouped grid's rows depend on how many columns fit.
+        let w = Rc::downgrade(tab);
+        tab.size_probe.connect_resize(move |_, _, _| {
+            let w = w.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(tab) = w.upgrade() {
+                    tab.sync_columns();
+                }
+            });
+        });
+    }
+
+    fn mode(&self) -> (Mode, bool) {
+        self.win()
+            .map_or((Mode::List, false), |w| (w.mode.get(), w.grouped.get()))
+    }
+
+    fn zoom(&self) -> u32 {
+        self.win().map_or(48, |w| ZOOM_LEVELS[w.zoom.get()])
+    }
+
+    /// The column the files are sorted by, and whether descending.
+    pub(super) fn sort_state(&self) -> (String, bool) {
+        let picked = self.view.sorter().and_downcast::<gtk::ColumnViewSorter>();
+        let title = picked
+            .as_ref()
+            .and_then(gtk::ColumnViewSorter::primary_sort_column)
+            .and_then(|c| c.title())
+            .map_or_else(|| "Name".to_owned(), |t| t.to_string());
+        let descending =
+            picked.is_some_and(|p| p.primary_sort_order() == gtk::SortType::Descending);
+        (title, descending)
+    }
+
+    /// Sorts by the column titled `title` (every view follows the list's
+    /// column headers).
+    pub(super) fn sort_by(&self, title: &str, descending: bool) {
+        let columns = self.view.columns();
+        let column = (0..columns.n_items())
+            .filter_map(|i| columns.item(i).and_downcast::<gtk::ColumnViewColumn>())
+            .find(|c| c.title().is_some_and(|t| t == title));
+        let order = if descending {
+            gtk::SortType::Descending
+        } else {
+            gtk::SortType::Ascending
+        };
+        self.view.sort_by_column(column.as_ref(), order);
+    }
+
+    /// Binds every row and tile again (after thumbnails were turned on or
+    /// off): the views let go of their model and take it back.
+    pub(super) fn rebind_list(self: &Rc<Self>) {
+        self.view.set_model(None::<&gtk::SelectionModel>);
+        self.grid.set_model(None::<&gtk::SelectionModel>);
+        self.groups.set_model(None::<&gtk::SelectionModel>);
+        self.apply_view();
+    }
+
     /// Remakes the grid tiles (after a zoom change, which resizes their
     /// thumbnail slots).
     pub(super) fn refresh_tiles(self: &Rc<Self>) {
@@ -238,19 +337,20 @@ impl Win {
             .set_factory(Some(&Self::tile_factory(self, false)));
         self.groups
             .set_factory(Some(&Self::tile_factory(self, true)));
-        if self.mode.get() == Mode::Grid && self.grouped.get() {
+        if self.shown.get() && self.mode() == (Mode::Grid, true) {
             self.rebuild_groups();
+        } else {
+            self.fit_grid();
         }
     }
-
     /// A tile (icon or thumbnail over the name) for grid views. In the
     /// `grouped` grid a cell can also be a group heading or an empty filler,
     /// and positions map to the shared selection through `grouped_model`.
     // One cell type for both grids; setup and bind read best side by side.
     #[allow(clippy::too_many_lines)]
-    fn tile_factory(win: &Rc<Self>, grouped: bool) -> gtk::SignalListItemFactory {
+    fn tile_factory(tab: &Rc<Self>, grouped: bool) -> gtk::SignalListItemFactory {
         let factory = gtk::SignalListItemFactory::new();
-        let w = Rc::downgrade(win);
+        let w = Rc::downgrade(tab);
         factory.connect_setup(move |_, item| {
             let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
                 return;
@@ -264,12 +364,9 @@ impl Win {
             // Top of the cell: icons line up across a row, and every name
             // starts right under its icon (one-line names don't sink).
             tile.set_valign(gtk::Align::Start);
-            // Top of the cell: icons line up across a row, and every name
-            // starts right under its icon (one-line names don't sink).
-            tile.set_valign(gtk::Align::Start);
             // A slot as tall as the icons and a third wider: photos and
             // videos fill it instead of a square, sitting on their name.
-            let size = tile_size(w.upgrade().map_or(48, |win| ZOOM_LEVELS[win.zoom.get()]));
+            let size = tile_size(w.upgrade().map_or(48, |tab| tab.zoom()));
             let (slot_w, slot_h) = size.slot;
             let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
             slot.set_size_request(slot_w, slot_h);
@@ -289,10 +386,6 @@ impl Win {
             label.set_wrap(true);
             label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             label.set_justify(gtk::Justification::Center);
-            // At least ~12 characters wide even when the icon is small, so
-            // ordinary names ("Development") fit on a line instead of
-            // breaking mid-word to the icon's width.
-            label.set_width_chars(12);
             // A fixed width per zoom level (see `tile_size`).
             label.set_width_chars(size.name_chars);
             label.set_max_width_chars(size.name_chars);
@@ -308,7 +401,6 @@ impl Win {
             Self::attach_item_dnd(&w, item, &tile, grouped);
             // Cell: the heading (grouped grid only) or the tile.
             let cell = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            cell.set_valign(gtk::Align::Start);
             cell.set_valign(gtk::Align::Start);
             let heading = group_heading();
             heading.set_visible(false);
@@ -409,25 +501,15 @@ impl Win {
         factory
     }
 
-    pub(super) fn set_view(self: &Rc<Self>, mode: Mode, grouped: bool) {
-        if self.mode.get() == mode && self.grouped.get() == grouped {
-            return;
+    /// Attaches the model of the view on screen (if the tab is) and shows
+    /// that view, for the window's view mode.
+    pub(super) fn apply_view(self: &Rc<Self>) {
+        let (mode, grouped) = self.mode();
+        // Group order first when grouped (the sorter reads `grouped`); only
+        // a fresh sort sees the change (see `resort`).
+        if self.sorted_grouped.replace(grouped) != grouped {
+            self.resort();
         }
-        self.mode.set(mode);
-        self.grouped.set(grouped);
-        save_view(mode, grouped);
-        self.apply_view();
-    }
-
-    fn apply_view(self: &Rc<Self>) {
-        let (mode, grouped) = (self.mode.get(), self.grouped.get());
-        // The buttons reflect the state (their handlers ignore no-op changes).
-        self.list_btn.set_active(mode == Mode::List);
-        self.grid_btn.set_active(mode == Mode::Grid);
-        self.group_btn.set_active(grouped);
-
-        // Group order first when grouped (the sorter reads `grouped`).
-        self.group_sorter.changed(gtk::SorterChange::Different);
         let sections = grouped && mode == Mode::List;
         self.sorted
             .set_section_sorter(sections.then_some(&self.group_sorter));
@@ -439,18 +521,20 @@ impl Win {
             (Mode::Grid, false) => "grid",
             (Mode::Grid, true) => "groups",
         };
-        // Only the view on screen follows the file list: hidden ones would
-        // keep making and filling tiles (and loading thumbnails) unseen.
+        // Only the view on screen follows the file list: hidden ones (and
+        // tabs off screen) would keep making and filling tiles unseen.
+        let shown = self.shown.get();
         self.view
-            .set_model((page == "list").then_some(&self.selection));
+            .set_model((shown && page == "list").then_some(&self.selection));
         self.grid
-            .set_model((page == "grid").then_some(&self.selection));
+            .set_model((shown && page == "grid").then_some(&self.selection));
         self.groups
-            .set_model((page == "groups").then_some(&self.grouped_model));
-        if page == "groups" {
+            .set_model((shown && page == "groups").then_some(&self.grouped_model));
+        if shown && page == "groups" {
             self.rebuild_groups();
         } else {
             self.clear_groups();
+            self.fit_grid();
         }
         self.views.set_visible_child_name(page);
         self.reveal_top();
@@ -462,7 +546,7 @@ impl Win {
     /// sight. Runs as the list changes, before GTK lays the view out again,
     /// so the scroll position read here is still the one the user left.
     pub(super) fn keep_top(&self) {
-        let (adj, n) = match (self.mode.get(), self.grouped.get()) {
+        let (adj, n) = match self.mode() {
             (Mode::List, _) => (self.view.vadjustment(), self.sorted.n_items()),
             (Mode::Grid, false) => (self.grid.vadjustment(), self.sorted.n_items()),
             (Mode::Grid, true) => (self.groups.vadjustment(), self.grouped_model.n_items()),
@@ -471,7 +555,7 @@ impl Win {
             return;
         }
         let flags = gtk::ListScrollFlags::NONE;
-        match (self.mode.get(), self.grouped.get()) {
+        match self.mode() {
             (Mode::List, _) => self.view.scroll_to(0, None, flags, None),
             (Mode::Grid, false) => self.grid.scroll_to(0, flags, None),
             (Mode::Grid, true) => self.groups.scroll_to(0, flags, None),
@@ -481,7 +565,7 @@ impl Win {
     /// GTK anchors the list to its first item, which leaves the first group
     /// heading just above the view; scroll to the very top so it shows.
     pub(super) fn reveal_top(&self) {
-        if self.mode.get() != Mode::List || !self.grouped.get() {
+        if self.mode() != (Mode::List, true) {
             return;
         }
         if let Some(adj) = self.view.vadjustment() {
@@ -498,7 +582,7 @@ impl Win {
     /// `width` wide: each cell is a thumbnail slot plus the tile's padding
     /// and margin (`style.css`), inside the grid's own padding.
     pub(super) fn group_columns(&self, width: i32) -> u32 {
-        let size = tile_size(ZOOM_LEVELS[self.zoom.get()]);
+        let size = tile_size(self.zoom());
         // About 7 px per character of name.
         let cell = size.slot.0.max(size.name_chars * 7) + 6 + 6 + 2 + 2;
         let usable = (width - 2 * 8).max(cell);
@@ -507,7 +591,7 @@ impl Win {
 
     /// Lays the grouped grid out (it then follows the folder's contents by
     /// itself), for an estimate of the columns until a tile can be
-    /// measured (see `sync_group_columns`).
+    /// measured (see `sync_columns`).
     fn rebuild_groups(self: &Rc<Self>) {
         if self.grouped_model.columns() == 0 {
             let width = [
@@ -520,7 +604,30 @@ impl Win {
             .unwrap_or(800);
             self.set_group_columns(self.group_columns(width));
         }
-        self.sync_group_columns();
+        self.sync_columns();
+    }
+
+    /// Caps the plain grid at the columns that fit, from an estimate until
+    /// a tile can be measured (see `sync_columns`). GTK keeps 30 rows of
+    /// tiles ready at its maximum column count, so the default cap of 24
+    /// meant hundreds of tiles made and filled that could never show.
+    fn fit_grid(self: &Rc<Self>) {
+        if !self.shown.get() || self.mode() != (Mode::Grid, false) {
+            return;
+        }
+        let width = [
+            self.grid.width(),
+            self.views.width(),
+            self.size_probe.width(),
+        ]
+        .into_iter()
+        .find(|w| *w > 0)
+        .unwrap_or(800);
+        // One more than the estimate: a column too few would show for a
+        // frame, one too many costs only a row of spare tiles.
+        self.grid
+            .set_max_columns((self.group_columns(width) + 1).min(24));
+        self.sync_columns();
     }
 
     /// Holds the grouped grid to `columns` columns and lays the groups out
@@ -538,14 +645,14 @@ impl Win {
         }
     }
 
-    /// Works out the grouped grid's columns from a real tile: every file
-    /// tile at a zoom level is the same width, so as many as fit the grid's
-    /// width. Checked on the next frames (a fresh grid has no tile to
+    /// Works out the grid's columns from a real tile: every file tile at a
+    /// zoom level is the same width, so as many as fit the grid's width.
+    /// The grouped grid is laid out for them, the plain one capped at them. Checked on the next frames (a fresh grid has no tile to
     /// measure yet) until the count holds for two of them. Each request (a
     /// new layout, a resize, a zoom, showing the grid) replaces any check
     /// still running, so one stalled by the grid being hidden can't block
     /// later ones.
-    pub(super) fn sync_group_columns(self: &Rc<Self>) {
+    pub(super) fn sync_columns(self: &Rc<Self>) {
         /// Frames to wait for a tile to measure (a big folder takes a while).
         const MAX_FRAMES: u32 = 120;
         /// Frames the count must hold to stop.
@@ -553,12 +660,14 @@ impl Win {
         if let Some(old) = self.group_tick.take() {
             old.remove();
         }
-        if self.mode.get() != Mode::Grid || !self.grouped.get() {
+        let mode = self.mode();
+        if !self.shown.get() || mode.0 != Mode::Grid {
             return;
         }
         let w = Rc::downgrade(self);
         let (frames, held) = (Cell::new(0), Cell::new(0));
-        let id = self.groups.add_tick_callback(move |grid, _| {
+        let grid = if mode.1 { &self.groups } else { &self.grid };
+        let id = grid.add_tick_callback(move |grid, _| {
             let Some(win) = w.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -568,7 +677,7 @@ impl Win {
                 glib::ControlFlow::Break
             };
             frames.set(frames.get() + 1);
-            if frames.get() > MAX_FRAMES || win.mode.get() != Mode::Grid || !win.grouped.get() {
+            if frames.get() > MAX_FRAMES || !win.shown.get() || win.mode() != mode {
                 return done(&win);
             }
             let (Some(cell), width) = (file_cell_width(grid), grid.width()) else {
@@ -578,6 +687,19 @@ impl Win {
                 return glib::ControlFlow::Continue;
             }
             let columns = u32::try_from(width / cell.max(1)).unwrap_or(1).clamp(1, 24);
+            if !mode.1 {
+                if grid.max_columns() == columns {
+                    held.set(held.get() + 1);
+                    return if held.get() >= SETTLED {
+                        done(&win)
+                    } else {
+                        glib::ControlFlow::Continue
+                    };
+                }
+                held.set(0);
+                grid.set_max_columns(columns);
+                return glib::ControlFlow::Continue;
+            }
             if columns == win.grouped_model.columns() && grid.max_columns() == columns {
                 held.set(held.get() + 1);
                 if held.get() >= SETTLED {
@@ -602,7 +724,7 @@ impl Win {
 
     /// The widget showing files right now (for focus).
     pub(super) fn active_view(&self) -> gtk::Widget {
-        match (self.mode.get(), self.grouped.get()) {
+        match self.mode() {
             (Mode::List, _) => self.view.clone().upcast(),
             (Mode::Grid, false) => self.grid.clone().upcast(),
             (Mode::Grid, true) => self.groups.clone().upcast(),
@@ -616,7 +738,7 @@ impl Win {
     /// Scrolls to and focuses the item at `pos` of the shared model.
     pub(super) fn scroll_to_pos(&self, pos: u32) {
         let flags = gtk::ListScrollFlags::FOCUS;
-        match (self.mode.get(), self.grouped.get()) {
+        match self.mode() {
             (Mode::List, _) => self.view.scroll_to(pos, None, flags, None),
             (Mode::Grid, false) => self.grid.scroll_to(pos, flags, None),
             (Mode::Grid, true) => {

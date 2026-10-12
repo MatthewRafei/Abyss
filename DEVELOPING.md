@@ -8,17 +8,28 @@ working on the code.
 | File | What |
 | --- | --- |
 | `src/main.rs` | App setup, CSS |
-| `src/window.rs` | The window: sidebar, path bar, list, menus, bottom bars |
-| `src/places.rs` | Sidebar sources and saved order |
+| `src/window.rs` | The window: sidebar, toolbar and path bar, menus, bottom bars |
+| `src/window/tab.rs` | A tab: one folder's listing, history, filter, selection and views |
+| `src/window/panes.rs` | Panes of tabs, the split view, the saved session |
+| `src/places.rs` | Sidebar sources (incl. mounted shares, saved servers) and saved order |
+| `src/window/servers.rs` | Add Server form: protocol, address and folder into a location |
+| `src/window/undo.rs` | Undo: what each operation changed, and taking it back |
+| `src/window/batch_rename.rs` | Batch rename bar: rules, preview, problems |
+| `src/window/properties.rs` | Properties window: sizes, times, permissions, default app, free space |
+| `src/window/prefs_ui.rs` | Main menu, sort menu, Preferences and Keyboard Shortcuts windows |
+| `src/window/error_bar.rs` | The bar failures slide up in |
+| `src/prefs.rs` | Preferences, saved in `~/.config/abyss/settings` |
+| `src/starred.rs` | Starred files, saved in `~/.config/abyss/starred` |
 | `src/ops.rs` | Copy / move / trash / delete engine, conflicts |
 | `src/par.rs` | Parallel tree walk, cancellable blocking work, per-job limiter |
 | `src/search.rs` | Name matching and recursive search (LocalSearch, then a walk) |
 | `src/thumbs.rs` | Thumbnail renderers, shared and own caches, render queue |
 | `src/info.rs` | Listing attributes (name-only types locally), shared per-type icons |
+| `src/listing.rs` | A folder's files as a list model, following changes in batches |
 | `src/section.rs` | Grouped grid layout: heading rows and fillers over the shared selection |
 | `src/window/views.rs` | List / grid / grouped views, grid tiles, view switching |
 | `src/dnd.rs` | Drag-and-drop rules |
-| `src/archive.rs` | Extraction via bsdtar |
+| `src/archive.rs` | Extraction and compression via bsdtar |
 | `src/chooser.rs` | Open With chooser |
 | `src/auth.rs` | Sign-in bar and per-server login cache |
 | `src/filename.rs` | Name helpers ("(2)", "(Copy)", extensions) |

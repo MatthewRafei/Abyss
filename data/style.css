@@ -197,7 +197,11 @@ window.abyss columnview.files > listview > row:hover {
   background-color: var(--hud-track, #262626);
 }
 
-window.abyss columnview.files > listview > row:selected {
+/* :active is what GTK puts on rows under a rubber band while it's still
+   being dragged; they look selected at once, as in Nautilus, rather than
+   only when the button is released. */
+window.abyss columnview.files > listview > row:selected,
+window.abyss columnview.files > listview > row:active {
   background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 28%, transparent);
   color: var(--hud-text, #eeeeee);
 }
@@ -393,10 +397,38 @@ window.abyss button.job-cancel:hover {
   color: #e5534b;
 }
 
+/* Error bar: a failure, said where it's seen */
+window.abyss .error-bar {
+  background-color: color-mix(in srgb, #e5534b 14%, var(--hud-card, #1c1c1c));
+  border-top: 2px solid #e5534b;
+}
+
+window.abyss .error-bar .error-icon {
+  color: #e5534b;
+  margin-top: 2px;
+}
+
+window.abyss .error-bar button.error-close {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px;
+  border-radius: 99px;
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss .error-bar button.error-close:hover {
+  background-color: color-mix(in srgb, #e5534b 25%, transparent);
+  color: #e5534b;
+}
+
 /* Sign-in bar */
 window.abyss .auth entry,
 window.abyss .auth passwordentry {
   min-height: 30px;
+}
+
+window.abyss .auth .refused {
+  color: #e5534b;
 }
 
 window.abyss .auth checkbutton {
@@ -435,6 +467,7 @@ window.abyss gridview.files {
    padding, hover or selection. (Cell state still reaches the tile.) */
 window.abyss gridview.files > child,
 window.abyss gridview.files > child:hover,
+window.abyss gridview.files > child:active,
 window.abyss gridview.files > child:selected {
   background: none;
   padding: 0;
@@ -458,7 +491,8 @@ window.abyss gridview.files > child:hover .tile {
   background-color: var(--hud-track, #262626);
 }
 
-window.abyss gridview.files > child:selected .tile {
+window.abyss gridview.files > child:selected .tile,
+window.abyss gridview.files > child:active .tile {
   background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 28%, transparent);
   color: var(--hud-text, #eeeeee);
 }
@@ -517,4 +551,141 @@ window.abyss .linked.view-switch > button:last-child {
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
   border-left-width: 0;
+}
+
+/* Tabs and the split view. Each pane has a strip of tabs (shown with two
+   or more tabs, or while split); the active pane gets an accent outline. */
+window.abyss .pane-header {
+  padding: 4px 8px 2px;
+  background-color: var(--hud-card, #1c1c1c);
+  border-bottom: 1px solid var(--hud-border, #2a2a2a);
+}
+
+window.abyss .tab-strip {
+  border-spacing: 4px;
+}
+
+window.abyss .tab-chip {
+  padding: 2px 4px 2px 10px;
+  border-radius: 8px;
+  color: var(--hud-dim, #999999);
+}
+
+window.abyss .tab-chip:hover {
+  background-color: var(--hud-track, #262626);
+}
+
+window.abyss .tab-chip.current {
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 22%, transparent);
+  color: var(--hud-text, #eeeeee);
+}
+
+window.abyss button.tab-close {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  border-radius: 6px;
+  -gtk-icon-size: 12px;
+}
+
+window.abyss .pane-path {
+  color: var(--hud-faint, #666666);
+  font-size: 0.9em;
+  margin-left: 8px;
+}
+
+window.abyss .pane {
+  border: 1px solid transparent;
+}
+
+window.abyss .pane.active-pane {
+  border-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 60%, transparent);
+}
+
+window.abyss .panes > separator {
+  min-width: 1px;
+  background-color: var(--hud-border, #2a2a2a);
+}
+
+/* The rubber band drawn by dragging across empty space in a view. */
+window.abyss rubberband {
+  border: 1px solid var(--hud-accent, #8ab4f8);
+  border-radius: 4px;
+  background-color: color-mix(in srgb, var(--hud-accent, #8ab4f8) 18%, transparent);
+}
+
+/* Network rows' second line, and the Add Server form. */
+.place-detail {
+  font-size: 0.8em;
+  opacity: 0.6;
+}
+.add-server .server-preview {
+  font-family: monospace;
+  font-size: 0.9em;
+  opacity: 0.7;
+}
+.add-server .server-status {
+  font-size: 0.9em;
+}
+.add-server .server-status.error {
+  color: @error_color;
+}
+.add-server button.suggested-action:disabled {
+  opacity: 0.45;
+}
+
+/* Preferences, Properties, Keyboard Shortcuts */
+window.abyss.dialog-window .dialog-body {
+  padding: 18px 20px;
+}
+
+window.abyss.dialog-window .setting {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hud-border, #2a2a2a);
+}
+
+window.abyss.dialog-window .setting-detail {
+  font-size: 0.9em;
+}
+
+window.abyss.dialog-window .section {
+  font-weight: bold;
+  margin-top: 6px;
+}
+
+window.abyss.dialog-window .shortcut-keys {
+  font-family: monospace;
+  font-size: 0.92em;
+  color: var(--hud-accent, #8ab4f8);
+}
+
+window.abyss.dialog-window .title-2 {
+  font-size: 1.3em;
+  font-weight: bold;
+}
+
+/* Batch rename */
+window.abyss .batch-rename .rename-preview {
+  background: none;
+}
+
+window.abyss .batch-rename .rename-preview row {
+  padding: 2px 4px;
+}
+
+window.abyss .batch-rename .rename-changed {
+  color: var(--hud-accent, #8ab4f8);
+  font-weight: bold;
+}
+
+window.abyss .rename-problem {
+  color: #e5534b;
+}
+
+/* The footer's Undo, offered for a moment after an operation */
+window.abyss .footer button.undo {
+  min-height: 0;
+  padding: 0 8px;
+  color: var(--hud-accent, #8ab4f8);
+  font-weight: bold;
 }
