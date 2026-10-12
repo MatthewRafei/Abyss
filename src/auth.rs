@@ -68,6 +68,7 @@ pub struct AuthBar {
     title: gtk::Label,
     detail: gtk::Label,
     fields: gtk::Box,
+    buttons: gtk::Box,
     user: gtk::Entry,
     domain: gtk::Entry,
     password: gtk::PasswordEntry,
@@ -142,13 +143,20 @@ impl AuthBar {
         let options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         options.append(&anonymous);
         options.append(&remember);
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        buttons.append(&options);
-        buttons.append(&spacer);
+        let left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        left.set_hexpand(true);
+        left.append(&options);
+        left.append(&spacer);
         let choices = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        buttons.append(&choices);
-        buttons.append(&cancel);
-        buttons.append(&connect);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&choices);
+        actions.append(&cancel);
+        actions.append(&connect);
+        // The buttons go under the options when the window is narrow.
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.append(&left);
+        buttons.append(&actions);
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
         body.add_css_class("prompt");
@@ -167,6 +175,7 @@ impl AuthBar {
             title,
             detail,
             fields,
+            buttons,
             user,
             domain,
             password,
@@ -185,6 +194,17 @@ impl AuthBar {
 
     pub const fn widget(&self) -> &gtk::Revealer {
         &self.revealer
+    }
+
+    /// Narrow window: the fields stack, and the buttons go under the options.
+    pub fn set_compact(&self, compact: bool) {
+        let o = if compact {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        };
+        self.fields.set_orientation(o);
+        self.buttons.set_orientation(o);
     }
 
     fn wire(self: &Rc<Self>, cancel: &gtk::Button) {

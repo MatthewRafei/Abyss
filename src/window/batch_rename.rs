@@ -159,6 +159,7 @@ pub(super) fn problems(
 /// The bar's widgets and what it's renaming.
 pub(super) struct Bar {
     revealer: gtk::Revealer,
+    head: gtk::Box,
     title: gtk::Label,
     modes: [gtk::ToggleButton; 4],
     pages: gtk::Stack,
@@ -192,6 +193,7 @@ fn entry(placeholder: &str) -> gtk::Entry {
 fn caption(text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.add_css_class("dim-label");
+    label.set_xalign(0.0);
     label
 }
 
@@ -290,6 +292,7 @@ impl Bar {
         let summary = gtk::Label::new(None);
         summary.set_xalign(0.0);
         summary.set_hexpand(true);
+        summary.set_wrap(true);
         summary.add_css_class("dim-label");
         let cancel = gtk::Button::with_label("Cancel");
         let rename = gtk::Button::with_label("Rename");
@@ -313,6 +316,7 @@ impl Bar {
 
         let bar = Rc::new(Self {
             revealer,
+            head,
             title,
             modes,
             pages,
@@ -339,6 +343,24 @@ impl Bar {
 
     pub(super) const fn widget(&self) -> &gtk::Revealer {
         &self.revealer
+    }
+
+    /// Narrow window: the mode switch goes under the title, and each rule's
+    /// fields stack instead of sharing a row.
+    pub(super) fn set_compact(&self, compact: bool) {
+        let o = if compact {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        };
+        self.head.set_orientation(o);
+        let mut page = self.pages.first_child();
+        while let Some(row) = page {
+            if let Some(row) = row.downcast_ref::<gtk::Box>() {
+                row.set_orientation(o);
+            }
+            page = row.next_sibling();
+        }
     }
 
     /// Every field updates the preview as it changes.

@@ -208,6 +208,16 @@ impl Win {
         // On its own row the filter takes the spare width.
         self.controls.set_hexpand(compact);
         self.search.set_hexpand(compact);
+        // There it stretches, so it needn't hold room for a long filter.
+        self.search.set_width_chars(if compact { 1 } else { 16 });
+        // The bars at the bottom stack their rows too.
+        self.conflict_buttons.set_orientation(if compact {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        });
+        self.auth.set_compact(compact);
+        self.batch.set_compact(compact);
     }
 
     /// Remakes every tab's grid tiles (after a zoom change, which resizes

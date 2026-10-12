@@ -106,6 +106,7 @@ pub struct Win {
     job_handle: RefCell<Option<glib::JoinHandle<()>>>,
 
     conflict: gtk::Revealer,
+    conflict_buttons: gtk::Box,
     conflict_title: gtk::Label,
     conflict_detail: gtk::Label,
     conflict_entry: gtk::Entry,
@@ -501,6 +502,20 @@ fn is_dir(info: &gio::FileInfo) -> bool {
     info.file_type() == gio::FileType::Directory
 }
 
+/// Hide a bar's contents once it has slid away: a closed revealer still
+/// counts its child's width, which would keep the window from shrinking
+/// (and a tiling compositor would then crop it).
+fn collapse_when_hidden(revealer: &gtk::Revealer) {
+    let show = |r: &gtk::Revealer| {
+        if let Some(child) = r.child() {
+            child.set_visible(r.reveals_child() || r.is_child_revealed());
+        }
+    };
+    show(revealer);
+    revealer.connect_reveal_child_notify(show);
+    revealer.connect_child_revealed_notify(show);
+}
+
 fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     let b = gtk::Button::from_icon_name(icon);
     b.set_tooltip_text(Some(tip));
@@ -796,7 +811,7 @@ impl Win {
         job_amount.set_xalign(1.0);
         let job_bar = gtk::ProgressBar::new();
         job_bar.set_valign(gtk::Align::Center);
-        job_bar.set_width_request(220);
+        job_bar.set_width_request(120);
         let job_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         job_box.add_css_class("job");
         job_box.append(&job_label);
@@ -826,14 +841,21 @@ impl Win {
         let conflict_rename = gtk::Button::with_label("Rename…");
         let conflict_replace = gtk::Button::with_label("Replace");
         conflict_replace.add_css_class("suggested-action");
+        let conflict_options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        conflict_options.set_hexpand(true);
+        conflict_options.append(&conflict_entry);
+        conflict_options.append(&spacer);
+        conflict_options.append(&conflict_all);
+        let conflict_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        conflict_actions.set_halign(gtk::Align::End);
+        conflict_actions.append(&conflict_cancel);
+        conflict_actions.append(&conflict_skip);
+        conflict_actions.append(&conflict_rename);
+        conflict_actions.append(&conflict_replace);
+        // The buttons go under the options when the window is narrow.
         let conflict_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        conflict_buttons.append(&conflict_entry);
-        conflict_buttons.append(&spacer);
-        conflict_buttons.append(&conflict_all);
-        conflict_buttons.append(&conflict_cancel);
-        conflict_buttons.append(&conflict_skip);
-        conflict_buttons.append(&conflict_rename);
-        conflict_buttons.append(&conflict_replace);
+        conflict_buttons.append(&conflict_options);
+        conflict_buttons.append(&conflict_actions);
         let conflict_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
         conflict_box.add_css_class("prompt");
         conflict_box.add_css_class("conflict");
@@ -875,6 +897,16 @@ impl Win {
         let batch = batch_rename::Bar::new();
         main.append(batch.widget());
         let auth = auth::AuthBar::new();
+        for bar in [
+            &prompt,
+            errors.widget(),
+            batch.widget(),
+            auth.widget(),
+            &conflict,
+            &job,
+        ] {
+            collapse_when_hidden(bar);
+        }
         main.append(auth.widget());
         main.append(&conflict);
         main.append(&job);
@@ -932,6 +964,7 @@ impl Win {
             job_bar,
             job_handle: RefCell::default(),
             conflict,
+            conflict_buttons,
             conflict_title,
             conflict_detail,
             conflict_entry,
