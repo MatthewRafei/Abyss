@@ -217,31 +217,24 @@ type, and free space on the disk.
 
 ## Performance
 
-Measured on the machine Abyss is built on (Ryzen 7 5800X3D, 32 GB RAM,
-Samsung 990 PRO NVMe; NAS: TrueNAS over SMB / NFS at about 57 MB/s). "Before"
-is the previous Abyss build, or a standard tool where named.
+Measured on the machine Abyss is built on: Ryzen 7 5800X3D, 32 GB RAM,
+Samsung 990 PRO NVMe, and a TrueNAS box over SMB / NFS at about 57 MB/s.
 
-| Task | Before | Now |
-| --- | --- | --- |
-| Open a folder of 11,458 photos (grouped grid) | | listed 85 ms after the window shows, 62 MB of memory (was 245–273 MB) |
-| Fling through all 11,458 photo thumbnails | 12 s CPU, worst frame 84 ms | 2 s CPU, worst frame 17 ms |
-| 5,000 files appearing in an open folder | 1.25 s CPU (GTK's directory model) | 0.16–0.20 s |
-| Plain grid: tiles built for one screen | 1,100+ | about 300 |
-| Window setup at startup | 620 ms | 360 ms (no full icon-theme scan) |
-| Copy 2,000 small files to SMB | 6.8 s (`cp -r`: 2.5 s, keeping dates: 27.6 s) | **1.8 s**, dates kept |
-| Copy them back from SMB | `cp -r`: 3.5 s | 1.7 s |
-| Copy 1,000 small files to NFS (GVfs) | 36.7 s | 18 s |
-| Copy a 1 GB file to / from SMB | `cp`: 18.4 s / 17.8 s | 19.1 s / 17.6 s (line speed) |
-| List 11,458 files on the NAS | 0.63 s | 0.42 s |
-| Search 78,695 NAS entries (no matches) | `find`: 2.4 s | 1.5 s |
-| Sort 50,000 items | | 0.11 s |
-| Idle | | about 7 wake-ups per 10 s, no CPU |
-
-What made the difference: thumbnails wait while a view is flung; Abyss keeps
-its own folder model (GTK's looks each changed file up by walking the whole
-list); copies set file dates in one batch at the end instead of after each
-file, which on a network share was a round trip per file; folders are read
-ahead while the views take in the last batch.
+| Task | Result |
+| --- | --- |
+| Open a folder of 11,458 photos (grouped grid) | listed 85 ms after the window shows, 62 MB of memory |
+| Fling through all 11,458 photo thumbnails | 2 s CPU, worst frame 17 ms |
+| 5,000 files appearing in an open folder | 0.16–0.20 s CPU |
+| Plain grid: tiles built for one screen | about 300 |
+| Window setup at startup | 360 ms |
+| Copy 2,000 small files to SMB (dates kept) | 1.8 s |
+| Copy them back from SMB | 1.7 s |
+| Copy 1,000 small files to NFS (GVfs) | 18 s |
+| Copy a 1 GB file to / from SMB | 19.1 s / 17.6 s (line speed) |
+| List 11,458 files on the NAS | 0.42 s |
+| Search 78,695 NAS entries (no matches) | 1.5 s |
+| Sort 50,000 items | 0.11 s |
+| Idle | about 7 wake-ups per 10 s, no CPU |
 
 ## Install
 
