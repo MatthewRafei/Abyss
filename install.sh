@@ -55,6 +55,6 @@ To use Abyss for other apps' Open / Save dialogs, once (needs root):
   doas install -m644 $here/data/abyss.portal $portal_file
 then add this under [preferred] in ~/.config/xdg-desktop-portal/portals.conf
   org.freedesktop.impl.portal.FileChooser=abyss;gtk
-and restart the portal: pkill -x xdg-desktop-portal
+and restart the portal: pkill -f 'xdg-desktop-portal$'
 EOF
 fi

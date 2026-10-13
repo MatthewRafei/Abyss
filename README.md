@@ -278,7 +278,7 @@ doas install -m644 data/abyss.portal /usr/share/xdg-desktop-portal/portals/
 # ~/.config/xdg-desktop-portal/portals.conf, under [preferred]
 #   (gtk is the fallback if Abyss isn't there):
 #   org.freedesktop.impl.portal.FileChooser=abyss;gtk
-pkill -x xdg-desktop-portal
+pkill -f 'xdg-desktop-portal$'
 ```
 
 GTK 4 apps use the portal when `GDK_DEBUG=portals` is set and GTK 3 apps
