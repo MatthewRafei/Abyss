@@ -12,6 +12,7 @@ mod listing;
 mod ops;
 mod par;
 mod places;
+mod portal;
 mod prefs;
 mod search;
 mod section;
@@ -25,7 +26,8 @@ use gtk::prelude::*;
 
 const APP_ID: &str = "io.github.MatthewRafei.Abyss";
 
-fn load_css() {
+/// Abyss' stylesheet, for every window on the display.
+pub fn load_css() {
     // GTK has already failed to start without a display; nothing to style.
     let Some(display) = gtk::gdk::Display::default() else {
         return;
@@ -40,6 +42,10 @@ fn load_css() {
 }
 
 fn main() -> glib::ExitCode {
+    // Started by D-Bus to serve other apps' Open / Save dialogs.
+    if std::env::args().nth(1).as_deref() == Some("--portal") {
+        return portal::run();
+    }
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN)

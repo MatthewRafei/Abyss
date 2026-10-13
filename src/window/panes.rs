@@ -264,7 +264,10 @@ impl Win {
         } else {
             ops::display_name(&file)
         };
-        self.window.set_title(Some(&format!("{name} — Abyss")));
+        // A file dialog keeps the title the app gave it.
+        if self.picker.borrow().is_none() {
+            self.window.set_title(Some(&format!("{name} — Abyss")));
+        }
         self.select_sidebar_row();
         // The filter box shows this tab's filter (its handler sees no change).
         let text = tab.search_text.borrow().clone();
@@ -505,6 +508,10 @@ impl Win {
     }
 
     fn save_session(&self) {
+        // A file dialog's folders aren't the browsing session.
+        if self.picker.borrow().is_some() {
+            return;
+        }
         let panes: Vec<serde_json::Value> = self
             .panes
             .iter()

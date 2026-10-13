@@ -987,8 +987,12 @@ impl Tab {
             let Some(info) = obj.downcast_ref::<gio::FileInfo>() else {
                 return false;
             };
-            let hidden_shown = tab.win().is_some_and(|win| win.show_hidden.get());
+            let win = tab.win();
+            let hidden_shown = win.as_ref().is_some_and(|win| win.show_hidden.get());
             if !hidden_shown && is_hidden(info) {
+                return false;
+            }
+            if win.is_some_and(|win| !win.picker_shows(info)) {
                 return false;
             }
             let shown = {
@@ -1519,6 +1523,10 @@ impl Tab {
             }
         }
         let Some(win) = self.win() else { return };
+        // In a file dialog, files are the answer instead.
+        if win.picker_activate(&targets) {
+            return;
+        }
         for (info, file) in targets {
             if !is_dir(&info) {
                 win.launch(&file, None);

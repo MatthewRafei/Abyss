@@ -36,4 +36,25 @@ sed -e "s|^Exec=abyss|Exec=$bin_dir/abyss|" -e "s|^Icon=.*|Icon=$app_id|" \
 if command -v update-desktop-database >/dev/null; then
     update-desktop-database "$apps_dir" 2>/dev/null || true
 fi
-echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop"
+
+# Other apps' file dialogs: D-Bus starts `abyss --portal` when one is
+# wanted. A copy still serving from before exits a minute after its last
+# dialog; the next one then runs the new binary.
+dbus_dir=${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services
+portal_service=org.freedesktop.impl.portal.desktop.abyss.service
+mkdir -p "$dbus_dir"
+sed "s|^Exec=abyss|Exec=$bin_dir/abyss|" "data/$portal_service" > "$dbus_dir/$portal_service"
+echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop, $dbus_dir/$portal_service"
+
+# xdg-desktop-portal only reads backends from its own data folder.
+portal_file=/usr/share/xdg-desktop-portal/portals/abyss.portal
+if ! cmp -s data/abyss.portal "$portal_file"; then
+    cat <<EOF
+
+To use Abyss for other apps' Open / Save dialogs, once (needs root):
+  doas install -m644 $here/data/abyss.portal $portal_file
+then add this under [preferred] in ~/.config/xdg-desktop-portal/portals.conf
+  org.freedesktop.impl.portal.FileChooser=abyss;gtk
+and restart the portal: pkill -x xdg-desktop-portal
+EOF
+fi

@@ -182,6 +182,15 @@ type, and free space on the disk.
   server for the session and answers the follow-up prompts itself, so you
   sign in once per server.
 
+**Other apps' file dialogs**
+- Abyss can be the Open / Save dialog of apps that ask the desktop portal
+  for one (Chrome, Firefox, sandboxed apps, GTK apps with
+  `GDK_DEBUG=portals`): your sidebar, views, thumbnails and filter, with a
+  name box when saving, the app's file types and extra options, and
+  Cancel / Open. Double-click or Enter picks a file; saving over one asks
+  first. Dialog windows leave your tabs and session alone. See
+  [Install](#install) to turn it on.
+
 ## Keys
 
 | Key | Action |
@@ -258,6 +267,23 @@ folders:
 ```sh
 xdg-mime default io.github.MatthewRafei.Abyss.desktop inode/directory
 ```
+
+To use Abyss for other apps' Open / Save dialogs, register it with
+xdg-desktop-portal (which only reads its own data folder, hence root), send
+file dialogs to it, and restart the portal. `install.sh` already installed
+the D-Bus service that starts `abyss --portal` when a dialog is wanted.
+
+```sh
+doas install -m644 data/abyss.portal /usr/share/xdg-desktop-portal/portals/
+# ~/.config/xdg-desktop-portal/portals.conf, under [preferred]
+#   (gtk is the fallback if Abyss isn't there):
+#   org.freedesktop.impl.portal.FileChooser=abyss;gtk
+pkill -x xdg-desktop-portal
+```
+
+GTK 4 apps use the portal when `GDK_DEBUG=portals` is set and GTK 3 apps
+with `GTK_USE_PORTAL=1`; Firefox with `widget.use-xdg-desktop-portal.file-picker`
+set to 1 in `about:config`.
 
 The release build is tuned for the CPU it's built on (`target-cpu=native`),
 so build it on the machine that runs it. Developer notes are in

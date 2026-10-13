@@ -31,6 +31,8 @@ mod error_bar;
 #[allow(clippy::wildcard_imports)]
 mod panes;
 #[allow(clippy::wildcard_imports)]
+pub mod picker;
+#[allow(clippy::wildcard_imports)]
 mod prefs_ui;
 #[allow(clippy::wildcard_imports)]
 mod properties;
@@ -149,6 +151,8 @@ pub struct Win {
     sidebar_drag: Cell<u32>,
     /// Files put on the clipboard by this process, and whether it was a cut.
     clip: RefCell<Option<(Vec<gio::File>, bool)>>,
+    /// Set when the window is another app's file dialog (`picker.rs`).
+    picker: RefCell<Option<Rc<picker::Picker>>>,
 }
 
 /// What holding a drag over a drop target for a moment does.
@@ -992,6 +996,7 @@ impl Win {
             bookmark_reveal,
             sidebar_drag: Cell::new(0),
             clip: RefCell::default(),
+            picker: RefCell::default(),
         });
 
         let w = Rc::downgrade(&win);
