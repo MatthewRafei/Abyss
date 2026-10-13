@@ -82,6 +82,12 @@ pub fn run() -> glib::ExitCode {
     app.set_inactivity_timeout(60_000);
     app.connect_startup(|app| {
         crate::load_css();
+        if let Some(desktop) = follow_desktop() {
+            // Kept for the app's life: dropping it stops the updates.
+            app.connect_shutdown(move |_| {
+                let _ = &desktop;
+            });
+        }
         if let Err(e) = serve(app) {
             eprintln!("abyss: can't serve the file chooser portal: {e}");
             app.quit();
@@ -90,6 +96,57 @@ pub fn run() -> glib::ExitCode {
     // A service has nothing to show until a dialog is asked for.
     app.connect_activate(|_| {});
     app.run_with_args(&["abyss"])
+}
+
+/// Off the portal, GTK only has `settings.ini`: no dark colour scheme, and
+/// the plain theme. Takes the desktop's look from `GSettings` instead (what
+/// the portal itself reads), and follows its changes.
+fn follow_desktop() -> Option<gio::Settings> {
+    let schema =
+        gio::SettingsSchemaSource::default()?.lookup("org.gnome.desktop.interface", true)?;
+    let desktop = gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None);
+    let apply = move |desktop: &gio::Settings| {
+        let Some(gtk_settings) = gtk::Settings::default() else {
+            return;
+        };
+        let has = |key: &str| schema.has_key(key);
+        for (key, setting) in [
+            ("gtk-theme", "gtk-theme-name"),
+            ("icon-theme", "gtk-icon-theme-name"),
+            ("cursor-theme", "gtk-cursor-theme-name"),
+            ("font-name", "gtk-font-name"),
+        ] {
+            if has(key) {
+                gtk_settings.set_property(setting, desktop.string(key).as_str());
+            }
+        }
+        if has("cursor-size") {
+            gtk_settings.set_property("gtk-cursor-theme-size", desktop.int("cursor-size"));
+        }
+        if has("color-scheme") {
+            let dark = desktop.string("color-scheme") == "prefer-dark";
+            gtk_settings.set_property("gtk-application-prefer-dark-theme", dark);
+            // GTK 4.20+: GtkInterfaceColorScheme DARK (2) or LIGHT (3).
+            set_enum(
+                gtk_settings.upcast_ref(),
+                "gtk-interface-color-scheme",
+                if dark { 2 } else { 3 },
+            );
+        }
+    };
+    apply(&desktop);
+    desktop.connect_changed(None, move |desktop, _| apply(desktop));
+    Some(desktop)
+}
+
+/// Sets an enum property by number, when this GTK has it.
+fn set_enum(object: &glib::Object, property: &str, value: i32) {
+    let Some(spec) = object.find_property(property) else {
+        return;
+    };
+    if let Some(v) = glib::EnumClass::with_type(spec.value_type()).and_then(|c| c.to_value(value)) {
+        object.set_property_from_value(property, &v);
+    }
 }
 
 fn serve(app: &gtk::Application) -> Result<(), glib::Error> {
