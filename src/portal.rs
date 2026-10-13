@@ -68,6 +68,13 @@ const ENDED: u32 = 2;
 
 /// Runs the backend until it has been idle for a minute.
 pub fn run() -> glib::ExitCode {
+    // GTK asks the portal for settings as it starts, while the portal waits
+    // for this backend to come up: neither would answer. Backends keep GTK
+    // off the portal (as xdg-desktop-portal-gnome does).
+    let debug = std::env::var("GDK_DEBUG")
+        .map_or_else(|_| "no-portals".to_owned(), |d| format!("{d},no-portals"));
+    std::env::set_var("GDK_DEBUG", debug);
+    std::env::remove_var("GTK_USE_PORTAL");
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::IS_SERVICE)
