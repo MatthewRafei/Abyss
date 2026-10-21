@@ -8,6 +8,7 @@ working on the code.
 | File | What |
 | --- | --- |
 | `src/main.rs` | App setup, CSS |
+| `src/fm1.rs` | `org.freedesktop.FileManager1` D-Bus service: other apps' "Show in Folder" and Properties |
 | `src/window.rs` | The window: sidebar, toolbar and path bar, menus, bottom bars |
 | `src/window/tab.rs` | A tab: one folder's listing, history, filter, selection and views |
 | `src/window/panes.rs` | Panes of tabs, the split view, the saved session |

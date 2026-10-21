@@ -14,6 +14,7 @@ app_id=io.github.MatthewRafei.Abyss
 bin_dir=$HOME/.local/bin
 apps_dir=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 icon_dir=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps
+dbus_dir=${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services
 
 cd "$here"
 cargo build --release
@@ -36,4 +37,13 @@ sed -e "s|^Exec=abyss|Exec=$bin_dir/abyss|" -e "s|^Icon=.*|Icon=$app_id|" \
 if command -v update-desktop-database >/dev/null; then
     update-desktop-database "$apps_dir" 2>/dev/null || true
 fi
-echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop"
+
+# FileManager1 (other apps' "Show in Folder"): the user's service file
+# takes precedence over a system file manager's.
+mkdir -p "$dbus_dir"
+cat > "$dbus_dir/org.freedesktop.FileManager1.service" <<EOF
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=$bin_dir/abyss --gapplication-service
+EOF
+echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop, $dbus_dir/org.freedesktop.FileManager1.service"

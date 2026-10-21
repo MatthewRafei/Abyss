@@ -614,6 +614,29 @@ fn terminal() -> Option<String> {
 
 impl Win {
     pub fn open(app: &gtk::Application, start: Option<gio::File>) {
+        Self::open_window(app, start, "");
+    }
+
+    /// A window on `folder` for another app (FileManager1): `items` in it
+    /// selected once it's read, and with `properties` their Properties
+    /// shown. `startup_id` lets the compositor hand it focus.
+    pub fn show(
+        app: &gtk::Application,
+        folder: gio::File,
+        items: Vec<gio::File>,
+        properties: bool,
+        startup_id: &str,
+    ) {
+        let win = Self::open_window(app, Some(folder), startup_id);
+        if properties && !items.is_empty() {
+            win.show_properties_of(items.clone());
+        }
+        if let Some(tab) = win.tab() {
+            tab.select_when_loaded(items);
+        }
+    }
+
+    fn open_window(app: &gtk::Application, start: Option<gio::File>, startup_id: &str) -> Rc<Self> {
         // Only the first window picks up the last session, and only when
         // no location was asked for.
         let first = app.windows().is_empty();
@@ -632,8 +655,12 @@ impl Win {
         win.window.connect_destroy(move |_| {
             keep.take();
         });
+        if !startup_id.is_empty() {
+            win.window.set_startup_id(startup_id);
+        }
         win.window.present();
         win.focus_view();
+        win
     }
 
     // Builds the whole widget tree; splitting it would just scatter it.

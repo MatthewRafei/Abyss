@@ -7,6 +7,7 @@ mod auth;
 mod chooser;
 mod dnd;
 mod filename;
+mod fm1;
 mod info;
 mod listing;
 mod ops;
@@ -44,8 +45,9 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
-    app.connect_startup(|_| {
+    app.connect_startup(|app| {
         load_css();
+        fm1::register(app);
         thumbs::prune_in_background();
     });
     app.connect_activate(|app| window::Win::open(app, None));

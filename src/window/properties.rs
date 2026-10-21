@@ -104,6 +104,10 @@ impl Win {
         if files.is_empty() {
             files.push(tab.current.borrow().clone());
         }
+        self.show_properties_of(files);
+    }
+
+    pub(super) fn show_properties_of(self: &Rc<Self>, files: Vec<gio::File>) {
         let win = self.clone();
         glib::spawn_future_local(async move {
             let mut items = Vec::with_capacity(files.len());

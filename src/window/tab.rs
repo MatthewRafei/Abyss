@@ -66,6 +66,9 @@ pub struct Tab {
     pub(super) scroll: Cell<f64>,
     /// Whether the files are sorted by group (as of the last sort).
     pub(super) sorted_grouped: Cell<bool>,
+    /// Files to select once the folder has been read (another app's "Show
+    /// in Folder").
+    pub(super) select_on_load: RefCell<Vec<gio::File>>,
 }
 
 impl Tab {
@@ -200,6 +203,7 @@ impl Tab {
             pending: Cell::new(!load),
             scroll: Cell::new(0.0),
             sorted_grouped: Cell::new(false),
+            select_on_load: RefCell::default(),
         });
 
         let w = Rc::downgrade(&tab);
@@ -1279,7 +1283,9 @@ impl Tab {
             }
             tab.schedule_status();
             if !list.is_loading() {
-                tab.reveal_top();
+                if !tab.select_waiting() {
+                    tab.reveal_top();
+                }
                 tab.refresh_free_space();
             }
         });
@@ -1476,6 +1482,37 @@ impl Tab {
                 Err(e) => win.show_error(&e.to_string()),
             }
         });
+    }
+
+    /// Selects `files` (in this folder) once it has been read, and scrolls
+    /// to the first of them.
+    pub(super) fn select_when_loaded(&self, files: Vec<gio::File>) {
+        *self.select_on_load.borrow_mut() = files;
+        if !self.list.borrow().is_loading() {
+            self.select_waiting();
+        }
+    }
+
+    /// Selects the files waiting for the folder to load; false when none
+    /// were waiting.
+    fn select_waiting(&self) -> bool {
+        let files = self.select_on_load.take();
+        if files.is_empty() {
+            return false;
+        }
+        self.selection.unselect_all();
+        let mut first = None;
+        for pos in 0..self.selection.n_items() {
+            let file = self.item(pos).and_then(|info| info_file(info.upcast_ref()));
+            if file.is_some_and(|file| files.iter().any(|f| f.equal(&file))) {
+                self.selection.select_item(pos, false);
+                first.get_or_insert(pos);
+            }
+        }
+        if let Some(pos) = first {
+            self.scroll_to_pos(pos);
+        }
+        true
     }
 
     // ------------------------------------------------------------ opening --
