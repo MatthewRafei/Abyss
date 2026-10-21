@@ -181,7 +181,8 @@ mod tests {
         let hits = parse_index(out, "read", false);
         assert_eq!(hits, [PathBuf::from("/home/u/Notes/read me.txt")]);
         assert_eq!(parse_index(out, "read", true).len(), 2);
-        assert!(parse_index("Results:\n  None\n", "x", true).is_empty());
+        let none: [PathBuf; 0] = [];
+        assert_eq!(parse_index("Results:\n  None\n", "x", true), none);
     }
 
     #[test]
