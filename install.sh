@@ -15,6 +15,7 @@ bin_dir=$HOME/.local/bin
 apps_dir=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 icon_dir=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps
 dbus_dir=${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services
+portal_dir=${XDG_DATA_HOME:-$HOME/.local/share}/xdg-desktop-portal/portals
 
 cd "$here"
 cargo build --release
@@ -46,4 +47,39 @@ cat > "$dbus_dir/org.freedesktop.FileManager1.service" <<EOF
 Name=org.freedesktop.FileManager1
 Exec=$bin_dir/abyss --gapplication-service
 EOF
-echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop, $dbus_dir/org.freedesktop.FileManager1.service"
+
+# FileChooser portal (other apps' Open and Save dialogs). xdg-desktop-portal
+# reads backends from one folder, /usr/share/xdg-desktop-portal/portals,
+# unless XDG_DESKTOP_PORTAL_DIR names another: this user folder, holding
+# Abyss's backend and links to the system's. With it set, the portal also
+# reads its *-portals.conf only from there, so those are linked in too
+# (the user's over the system's). Re-run after installing another portal
+# backend or adding a portals.conf.
+# Started by the portal, Abyss must not ask the portal anything while GTK
+# starts (it waits for Abyss meanwhile): no-portals, as portal-gtk does.
+cat > "$dbus_dir/org.freedesktop.impl.portal.desktop.abyss.service" <<EOF
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.abyss
+Exec=/usr/bin/env GDK_DEBUG=no-portals $bin_dir/abyss --gapplication-service
+EOF
+mkdir -p "$portal_dir"
+for p in /usr/share/xdg-desktop-portal/portals/*.portal \
+    /usr/share/xdg-desktop-portal/*portals.conf \
+    /etc/xdg/xdg-desktop-portal/*portals.conf \
+    "${XDG_CONFIG_HOME:-$HOME/.config}"/xdg-desktop-portal/*portals.conf; do
+    [ -e "$p" ] && ln -sf "$p" "$portal_dir/"
+done
+install -m644 data/abyss.portal "$portal_dir/abyss.portal"
+# systemd starts the portal as a user service: point it at the folder.
+dropin=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/xdg-desktop-portal.service.d
+if systemctl --user show-environment >/dev/null 2>&1; then
+    mkdir -p "$dropin"
+    printf '[Service]\nEnvironment=XDG_DESKTOP_PORTAL_DIR=%s\n' "$portal_dir" > "$dropin/abyss.conf"
+    systemctl --user daemon-reload
+    echo "portal: restart it with: systemctl --user restart xdg-desktop-portal"
+else
+    echo "portal: start xdg-desktop-portal with XDG_DESKTOP_PORTAL_DIR=$portal_dir"
+fi
+echo "portal: choose Abyss in ~/.config/xdg-desktop-portal/<desktop>-portals.conf:"
+echo "    org.freedesktop.impl.portal.FileChooser=abyss;gtk;"
+echo "installed: $bin_dir/abyss, $apps_dir/$app_id.desktop, $dbus_dir/org.freedesktop.FileManager1.service, $portal_dir/abyss.portal"

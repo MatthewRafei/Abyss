@@ -9,6 +9,8 @@ working on the code.
 | --- | --- |
 | `src/main.rs` | App setup, CSS |
 | `src/fm1.rs` | `org.freedesktop.FileManager1` D-Bus service: other apps' "Show in Folder" and Properties |
+| `src/portal.rs` | xdg-desktop-portal `FileChooser` backend: other apps' Open and Save dialogs |
+| `src/window/pick.rs` | Pick mode: the window as such a dialog (name, type filter, Open/Save bar) |
 | `src/window.rs` | The window: sidebar, toolbar and path bar, menus, bottom bars |
 | `src/window/tab.rs` | A tab: one folder's listing, history, filter, selection and views |
 | `src/window/panes.rs` | Panes of tabs, the split view, the saved session |
@@ -48,6 +50,24 @@ cargo test
 
 `cargo test cancel_mid_extract -- --ignored --nocapture` cancels a real
 extraction mid-way; set `ABYSS_CANCEL_DEST` to a mounted share to test there.
+
+## File chooser portal
+
+`install.sh` sets Abyss up as the portal's `FileChooser` backend; pick it in
+`~/.config/xdg-desktop-portal/<desktop>-portals.conf` with
+`org.freedesktop.impl.portal.FileChooser=abyss;gtk;` and re-run
+`install.sh` (it links that file into the portal folder). Things learned:
+
+- The portal starts its backends and waits for each; GTK asks the portal for
+  settings while it starts, so the service file runs Abyss with
+  `GDK_DEBUG=no-portals` (as xdg-desktop-portal-gtk does), else both wait
+  25 s and the portal comes up without `FileChooser`.
+- Test off-screen: `Xvfb :77`, then `GDK_BACKEND=x11 DISPLAY=:77` and
+  `XDG_DATA_HOME` (holding a service file for the debug build) set before
+  `dbus-run-session`. Call the backend with `gdbus call`, but give paths as
+  `[byte 0x…]` arrays: gdbus corrupts `b'…'` byte strings. A client of the
+  real frontend must stay connected for its `Response`, so `gdbus call`
+  can't stand in for one there.
 
 ## Build flags
 

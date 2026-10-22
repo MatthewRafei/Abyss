@@ -31,6 +31,8 @@ mod error_bar;
 #[allow(clippy::wildcard_imports)]
 mod panes;
 #[allow(clippy::wildcard_imports)]
+mod pick;
+#[allow(clippy::wildcard_imports)]
 mod prefs_ui;
 #[allow(clippy::wildcard_imports)]
 mod properties;
@@ -149,6 +151,8 @@ pub struct Win {
     sidebar_drag: Cell<u32>,
     /// Files put on the clipboard by this process, and whether it was a cut.
     clip: RefCell<Option<(Vec<gio::File>, bool)>>,
+    /// Set while the window picks files for another app (`pick.rs`).
+    picker: RefCell<Option<Rc<pick::Picker>>>,
 }
 
 /// What holding a drag over a drop target for a moment does.
@@ -614,7 +618,7 @@ fn terminal() -> Option<String> {
 
 impl Win {
     pub fn open(app: &gtk::Application, start: Option<gio::File>) {
-        Self::open_window(app, start, "");
+        Self::open_window(app, start, "", |_| {});
     }
 
     /// A window on `folder` for another app (FileManager1): `items` in it
@@ -627,7 +631,7 @@ impl Win {
         properties: bool,
         startup_id: &str,
     ) {
-        let win = Self::open_window(app, Some(folder), startup_id);
+        let win = Self::open_window(app, Some(folder), startup_id, |_| {});
         if properties && !items.is_empty() {
             win.show_properties_of(items.clone());
         }
@@ -636,7 +640,14 @@ impl Win {
         }
     }
 
-    fn open_window(app: &gtk::Application, start: Option<gio::File>, startup_id: &str) -> Rc<Self> {
+    /// A new window at `start` (else the last session, or home);
+    /// `prepare` finishes setting it up before it's shown.
+    fn open_window(
+        app: &gtk::Application,
+        start: Option<gio::File>,
+        startup_id: &str,
+        prepare: impl FnOnce(&Rc<Self>),
+    ) -> Rc<Self> {
         // Only the first window picks up the last session, and only when
         // no location was asked for.
         let first = app.windows().is_empty();
@@ -658,6 +669,7 @@ impl Win {
         if !startup_id.is_empty() {
             win.window.set_startup_id(startup_id);
         }
+        prepare(&win);
         win.window.present();
         win.focus_view();
         win
@@ -1019,6 +1031,7 @@ impl Win {
             bookmark_reveal,
             sidebar_drag: Cell::new(0),
             clip: RefCell::default(),
+            picker: RefCell::default(),
         });
 
         let w = Rc::downgrade(&win);
@@ -3474,6 +3487,7 @@ impl Win {
         if let Some(tab) = self.tab() {
             self.status.set_text(&tab.status_text());
         }
+        self.update_pick();
     }
 
     /// Reports a failure in the error bar, which slides up from the bottom

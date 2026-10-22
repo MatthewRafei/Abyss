@@ -13,6 +13,7 @@ mod listing;
 mod ops;
 mod par;
 mod places;
+mod portal;
 mod prefs;
 mod search;
 mod section;
@@ -48,6 +49,7 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|app| {
         load_css();
         fm1::register(app);
+        portal::register(app);
         thumbs::prune_in_background();
     });
     app.connect_activate(|app| window::Win::open(app, None));
